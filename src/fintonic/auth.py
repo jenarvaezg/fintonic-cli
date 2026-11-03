@@ -4,6 +4,8 @@ Observed sequence in the web app:
   1. POST /oidc/token {username, password, deviceUUID}  -> tokens in body, `device-uuid` header
   2. PUT  /rest/device/provisions {deviceUuid}          -> 202, sends SMS
   3. PUT  /rest/device/verification {deviceUuid, verificationCode} -> 202
+
+`username` is the account email (the web form labels it "Email de usuario").
 """
 
 from __future__ import annotations
@@ -14,14 +16,23 @@ from dataclasses import dataclass, replace
 import httpx
 
 from fintonic.config import API_BASE
-from fintonic.errors import AuthError, DeviceVerificationRequired, SessionExpiredError, raise_for_response
-from fintonic.session import Session, SessionStore
+from fintonic.errors import (
+    AuthError,
+    DeviceVerificationRequired,
+    InvalidCredentialsError,
+    SessionExpiredError,
+    raise_for_response,
+)
+from fintonic.session import Session
+from fintonic.stores import SessionStore
 
 
 @dataclass(frozen=True)
 class LoginResult:
     session: Session
     needs_device_verification: bool
+    # The server ignored our verified device and issued a new one, so SMS is needed again.
+    device_changed: bool = False
 
 
 class Authenticator:
@@ -37,26 +48,30 @@ class Authenticator:
         try:
             raise_for_response(response)
         except SessionExpiredError as exc:
-            raise AuthError("Email o PIN incorrectos.") from exc
+            raise InvalidCredentialsError() from exc
 
         data = (response.json() or {}).get("data") or {}
         if data.get("error"):
-            raise AuthError(str(data.get("error_description") or data["error"]))
+            raise InvalidCredentialsError(str(data.get("error_description") or data["error"]))
 
         device_uuid = response.headers.get("device-uuid") or known_device
         access_token = data.get("access_token")
         if not access_token or not device_uuid:
             raise AuthError("Respuesta de login inesperada: faltan token o device-uuid.")
 
-        verified = bool(previous and previous.device_verified and device_uuid == known_device)
+        was_verified = bool(previous and previous.device_verified and known_device)
+        verified = was_verified and device_uuid == known_device
         session = Session(
             email=email,
             access_token=access_token,
-            refresh_token=data.get("refresh_token"),
             device_uuid=device_uuid,
             device_verified=verified,
         )
-        return LoginResult(session=session, needs_device_verification=not verified)
+        return LoginResult(
+            session=session,
+            needs_device_verification=not verified,
+            device_changed=was_verified and not verified,
+        )
 
     def request_verification_code(self, session: Session) -> None:
         """Ask Fintonic to send the SMS code. Not retried: each call sends an SMS."""
@@ -81,14 +96,25 @@ def _auth_headers(session: Session) -> dict[str, str]:
     return {"authorization": f"Bearer {session.access_token}", "device-uuid": session.device_uuid or ""}
 
 
-def stored_pin_relogin(auth: Authenticator, store: SessionStore) -> Callable[[Session], Session] | None:
-    """Return a callback that silently logs in again with a PIN saved via `login --remember`."""
+def stored_pin_relogin(auth: Authenticator, store: SessionStore) -> Callable[[Session], Session]:
+    """Callback that silently logs in again with a PIN saved via `login --remember`.
+
+    A rejected PIN is deleted on the spot: retrying a stale PIN on every command would
+    get the account blocked.
+    """
 
     def relogin(current: Session) -> Session:
         pin = store.load_pin(current.email)
         if not pin:
             raise SessionExpiredError()
-        result = auth.login(current.email, pin, previous=current)
+        try:
+            result = auth.login(current.email, pin, previous=current)
+        except AuthError as exc:
+            store.delete_pin(current.email)
+            raise AuthError(
+                f"El re-login automático ha fallado ({exc}). He borrado el PIN guardado para no bloquear "
+                "la cuenta; ejecuta `fintonic login --remember`."
+            ) from exc
         if result.needs_device_verification:
             raise DeviceVerificationRequired()
         store.save(result.session)

@@ -9,7 +9,8 @@ from typer.testing import CliRunner
 
 from fintonic import cli
 from fintonic.output import format_eur
-from fintonic.session import MemorySessionStore, Session
+from fintonic.session import Session
+from fintonic.stores import FileSessionStore, MemorySessionStore
 from tests.conftest import API, DEVICE, make_jwt, make_tx
 
 runner = CliRunner()
@@ -57,6 +58,7 @@ def test_transactions_csv(mock_api: respx.MockRouter, store: MemorySessionStore)
 def test_login_with_sms(mock_api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch) -> None:
     memory = MemorySessionStore()
     monkeypatch.setattr(cli, "_store", lambda: memory)
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
     body = {"data": {"access_token": make_jwt(), "refresh_token": make_jwt(), "error": None}}
     mock_api.post(f"{API}/oidc/token").mock(
         return_value=httpx.Response(200, json=body, headers={"device-uuid": DEVICE})
@@ -89,6 +91,50 @@ def test_products_table_hides_canceled(mock_api: respx.MockRouter, store: Memory
     rows = list(csv.DictReader(io.StringIO(result.stdout)))
     assert [r["nombre"] for r in rows] == ["Visa viva"]
     assert rows[0]["saldo"] == "-5000"
+
+
+def test_headless_login_sends_sms_then_verify(mock_api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch) -> None:
+    memory = MemorySessionStore()
+    monkeypatch.setattr(cli, "_store", lambda: memory)
+    body = {"data": {"access_token": make_jwt(), "error": None}}
+    mock_api.post(f"{API}/oidc/token").mock(
+        return_value=httpx.Response(200, json=body, headers={"device-uuid": DEVICE})
+    )
+    sms = mock_api.put(f"{API}/rest/device/provisions").mock(return_value=httpx.Response(202))
+    verify = mock_api.put(f"{API}/rest/device/verification").mock(return_value=httpx.Response(202))
+
+    first = runner.invoke(cli.app, ["login", "--email", "user@example.com", "--pin-stdin"], input="1234\n")
+    assert first.exit_code == 0, first.output
+    assert sms.called and not verify.called
+    assert memory.session and not memory.session.device_verified
+    assert "fintonic verify" in first.stderr
+
+    blocked = runner.invoke(cli.app, ["position"])
+    assert "verify" in str(blocked.exception)
+
+    second = runner.invoke(cli.app, ["verify", "9876"])
+    assert second.exit_code == 0, second.output
+    assert memory.session.device_verified
+
+
+def test_pin_from_env(mock_api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, session: Session) -> None:
+    memory = MemorySessionStore(session)
+    monkeypatch.setattr(cli, "_store", lambda: memory)
+    monkeypatch.setenv("FINTONIC_PIN", "4321")
+    route = mock_api.post(f"{API}/oidc/token").mock(
+        return_value=httpx.Response(200, json={"data": {"access_token": make_jwt()}}, headers={"device-uuid": DEVICE})
+    )
+    result = runner.invoke(cli.app, ["login"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(route.calls.last.request.content)["password"] == "4321"
+
+
+def test_file_store_via_env(monkeypatch: pytest.MonkeyPatch, tmp_path, session: Session) -> None:
+    path = tmp_path / "s.json"
+    FileSessionStore(path).save(session)
+    result = runner.invoke(cli.app, ["status"], env={"FINTONIC_STORE": "file", "FINTONIC_STORE_PATH": str(path)})
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["store"] == "FileSessionStore"
 
 
 def test_logout_keeps_device(store: MemorySessionStore, session: Session) -> None:

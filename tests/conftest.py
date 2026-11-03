@@ -66,7 +66,6 @@ def session() -> Session:
     return Session(
         email="user@example.com",
         access_token=make_jwt(),
-        refresh_token=make_jwt(),
         device_uuid=DEVICE,
         device_verified=True,
     )

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import sys
+from dataclasses import dataclass
 from datetime import date, datetime
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -10,10 +14,10 @@ from rich.console import Console
 
 from fintonic.auth import Authenticator, stored_pin_relogin
 from fintonic.client import PRODUCT_ENDPOINTS, FintonicClient
-from fintonic.errors import FintonicError, NotLoggedInError
+from fintonic.errors import DeviceVerificationRequired, FintonicError, NotLoggedInError
 from fintonic.http import build_http_client
 from fintonic.output import OutputFormat, format_eur, print_json, render
-from fintonic.session import KeyringSessionStore, SessionStore
+from fintonic.stores import SessionStore, StoreKind, resolve_store
 
 app = typer.Typer(no_args_is_help=True, help="CLI no oficial para Fintonic.")
 err = Console(stderr=True)
@@ -21,8 +25,40 @@ err = Console(stderr=True)
 FormatOpt = Annotated[OutputFormat, typer.Option("--format", "-f", help="Formato de salida.")]
 
 
+@dataclass
+class _StoreOptions:
+    kind: StoreKind = StoreKind.auto
+    path: Path | None = None
+
+
+_store_options = _StoreOptions()
+
+
+@app.callback()
+def _global_options(
+    store: Annotated[
+        StoreKind,
+        typer.Option(
+            "--store",
+            envvar="FINTONIC_STORE",
+            help="Dónde guardar la sesión: keyring, file (0600) o auto (keyring si hay, si no file).",
+        ),
+    ] = StoreKind.auto,
+    store_path: Annotated[
+        Path | None,
+        typer.Option(envvar="FINTONIC_STORE_PATH", help="Ruta del fichero con --store file."),
+    ] = None,
+) -> None:
+    _store_options.kind = store
+    _store_options.path = store_path
+
+
 def _store() -> SessionStore:
-    return KeyringSessionStore()
+    return resolve_store(_store_options.kind, _store_options.path)
+
+
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
 
 
 def _client(store: SessionStore | None = None) -> FintonicClient:
@@ -30,6 +66,8 @@ def _client(store: SessionStore | None = None) -> FintonicClient:
     session = store.load()
     if not session or not session.access_token:
         raise NotLoggedInError()
+    if not session.device_verified:
+        raise DeviceVerificationRequired()
     http = build_http_client()
     relogin = stored_pin_relogin(Authenticator(http), store)
     return FintonicClient(session, http=http, store=store, relogin=relogin)
@@ -39,30 +77,70 @@ def _parse_date(value: str | None) -> date | None:
     return datetime.strptime(value, "%Y-%m-%d").date() if value else None
 
 
+def _read_pin(pin_stdin: bool) -> str:
+    if pin := os.environ.get("FINTONIC_PIN"):
+        return pin
+    if pin_stdin:
+        pin = sys.stdin.readline().strip()
+        if not pin:
+            raise typer.BadParameter("No se ha recibido el PIN por stdin.")
+        return pin
+    return typer.prompt("PIN", hide_input=True)
+
+
 @app.command()
 def login(
-    email: Annotated[str | None, typer.Option(envvar="FINTONIC_EMAIL", help="Email de la cuenta.")] = None,
-    remember: Annotated[bool, typer.Option(help="Guardar el PIN en el Keychain para re-login automático.")] = False,
+    email: Annotated[
+        str | None,
+        typer.Option(envvar="FINTONIC_EMAIL", help="Email de la cuenta (la API lo recibe como `username`)."),
+    ] = None,
+    remember: Annotated[bool, typer.Option(help="Guardar el PIN para re-login automático.")] = False,
+    pin_stdin: Annotated[bool, typer.Option(help="Leer el PIN de stdin (también vale FINTONIC_PIN).")] = False,
+    request_sms: Annotated[
+        bool,
+        typer.Option(help="No pedir el código: enviar el SMS y salir. Completar con `fintonic verify CODIGO`."),
+    ] = False,
 ) -> None:
-    """Inicia sesión (PIN + SMS la primera vez en este dispositivo)."""
+    """Inicia sesión. La primera vez en un dispositivo pide verificación por SMS."""
     store = _store()
     previous = store.load()
     email = email or (previous.email if previous else None) or typer.prompt("Email")
-    pin = typer.prompt("PIN", hide_input=True)
+    pin = _read_pin(pin_stdin)
 
     with build_http_client() as http:
         auth = Authenticator(http)
         result = auth.login(email, pin, previous=previous)
         session = result.session
+        if remember:
+            store.save_pin(email, pin)
         if result.needs_device_verification:
+            if result.device_changed:
+                err.print("[yellow]Fintonic ha asignado un dispositivo nuevo: hay que verificarlo otra vez.[/yellow]")
             auth.request_verification_code(session)
-            code = typer.prompt("Código SMS")
-            session = auth.verify_device(session, code)
+            if request_sms or not _stdin_is_tty():
+                store.save(session)
+                err.print("SMS enviado. Completa con `fintonic verify CODIGO` antes de que caduque la sesión (30 min).")
+                return
+            session = auth.verify_device(session, typer.prompt("Código SMS"))
 
     store.save(session)
-    if remember:
-        store.save_pin(email, pin)
     err.print(f"[green]Sesión iniciada[/green] como {email} (caduca {session.expires_at:%H:%M}).")
+
+
+@app.command()
+def verify(code: Annotated[str, typer.Argument(help="Código recibido por SMS.")]) -> None:
+    """Completa la verificación por SMS iniciada con `login --request-sms`."""
+    store = _store()
+    session = store.load()
+    if not session or not session.access_token:
+        raise NotLoggedInError()
+    if session.device_verified:
+        err.print("El dispositivo ya está verificado.")
+        return
+    with build_http_client() as http:
+        session = Authenticator(http).verify_device(session, code)
+    store.save(session)
+    err.print(f"[green]Dispositivo verificado.[/green] Sesión activa hasta las {session.expires_at:%H:%M}.")
 
 
 @app.command()
@@ -93,6 +171,7 @@ def status() -> None:
     print_json(
         {
             "email": session.email,
+            "store": type(store).__name__,
             "logged_in": bool(session.access_token) and not session.is_expired(),
             "expires_at": expires.isoformat() if expires else None,
             "device_verified": session.device_verified,

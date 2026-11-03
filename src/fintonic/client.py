@@ -12,7 +12,8 @@ from fintonic.config import API_BASE, BFF_BASE
 from fintonic.errors import NotLoggedInError, SessionExpiredError, raise_for_response
 from fintonic.http import build_http_client
 from fintonic.models import BankRegistry, Category, Position, Product, Transaction, TransactionDateRange
-from fintonic.session import Session, SessionStore
+from fintonic.session import Session
+from fintonic.stores import SessionStore
 
 PRODUCT_ENDPOINTS: Mapping[str, str] = {
     "account": "rest/account/listAccounts",

@@ -9,7 +9,8 @@ import respx
 from fintonic.client import FintonicClient
 from fintonic.errors import ApiError, DeviceVerificationRequired, NotLoggedInError, SessionExpiredError
 from fintonic.models import Transaction
-from fintonic.session import MemorySessionStore, Session
+from fintonic.session import Session
+from fintonic.stores import MemorySessionStore
 from tests.conftest import API, BFF, make_jwt, make_tx
 
 TX_LIST = f"{API}/rest/transaction/list"

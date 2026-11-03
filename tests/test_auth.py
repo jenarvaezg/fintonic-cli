@@ -7,8 +7,17 @@ import pytest
 import respx
 
 from fintonic.auth import Authenticator, stored_pin_relogin
-from fintonic.errors import AuthError, DeviceVerificationRequired, SessionExpiredError, SmsLimitExceeded
-from fintonic.session import MemorySessionStore, Session
+from fintonic.errors import (
+    AuthError,
+    BlockedUserError,
+    DeviceVerificationRequired,
+    InvalidCredentialsError,
+    NetworkBlockedError,
+    SessionExpiredError,
+    SmsLimitExceeded,
+)
+from fintonic.session import Session
+from fintonic.stores import MemorySessionStore
 from tests.conftest import API, DEVICE, make_jwt
 
 
@@ -78,12 +87,12 @@ def test_error_inside_data_raises(mock_api: respx.MockRouter, http: httpx.Client
 
 def test_blocked_user(mock_api: respx.MockRouter, http: httpx.Client) -> None:
     mock_api.post(f"{API}/oidc/token").mock(return_value=httpx.Response(403, json={"error": "Blocked user"}))
-    with pytest.raises(AuthError, match="bloqueado"):
+    with pytest.raises(BlockedUserError, match="bloqueado"):
         Authenticator(http).login("user@example.com", "1234")
 
 
 def test_sms_flow(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
-    unverified = Session(session.email, session.access_token, session.refresh_token, DEVICE, False)
+    unverified = Session(session.email, session.access_token, DEVICE, False)
     provision = mock_api.put(f"{API}/rest/device/provisions").mock(return_value=httpx.Response(202))
     verify = mock_api.put(f"{API}/rest/device/verification").mock(return_value=httpx.Response(202))
     auth = Authenticator(http)
@@ -129,3 +138,61 @@ def test_relogin_needing_sms_cannot_be_silent(mock_api: respx.MockRouter, http: 
     store.save_pin(session.email, "1234")
     with pytest.raises(DeviceVerificationRequired):
         stored_pin_relogin(Authenticator(http), store)(session)
+
+
+def test_server_reassigning_device_is_reported(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session
+) -> None:
+    mock_api.post(f"{API}/oidc/token").mock(return_value=_token_response("brand-new-device"))
+    result = Authenticator(http).login(session.email, "1234", previous=session)
+    assert result.needs_device_verification
+    assert result.device_changed
+    assert result.session.device_uuid == "brand-new-device"
+
+
+def test_first_login_is_not_reported_as_device_change(mock_api: respx.MockRouter, http: httpx.Client) -> None:
+    mock_api.post(f"{API}/oidc/token").mock(return_value=_token_response())
+    assert not Authenticator(http).login("user@example.com", "1234").device_changed
+
+
+def test_wrong_pin_is_invalid_credentials(mock_api: respx.MockRouter, http: httpx.Client) -> None:
+    mock_api.post(f"{API}/oidc/token").mock(
+        return_value=httpx.Response(401, json={"data": None, "error": {"errorCode": "401", "error": "Unauthorized"}})
+    )
+    with pytest.raises(InvalidCredentialsError):
+        Authenticator(http).login("user@example.com", "0000")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(401, json={"error": {"errorCode": "401", "error": "Unauthorized"}}),
+        httpx.Response(403, json={"error": "Blocked user"}),
+    ],
+)
+def test_relogin_failure_deletes_stored_pin_and_does_not_retry(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session, response: httpx.Response
+) -> None:
+    route = mock_api.post(f"{API}/oidc/token").mock(return_value=response)
+    store = MemorySessionStore(session)
+    store.save_pin(session.email, "1234")
+    relogin = stored_pin_relogin(Authenticator(http), store)
+
+    with pytest.raises(AuthError, match="He borrado el PIN"):
+        relogin(session)
+    with pytest.raises(SessionExpiredError):
+        relogin(session)  # second command: no PIN left, no new login attempt
+
+    assert store.load_pin(session.email) is None
+    assert route.call_count == 1
+
+
+def test_relogin_network_block_keeps_pin(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    mock_api.post(f"{API}/oidc/token").mock(
+        return_value=httpx.Response(403, text="<html>blocked</html>", headers={"content-type": "text/html"})
+    )
+    store = MemorySessionStore(session)
+    store.save_pin(session.email, "1234")
+    with pytest.raises(NetworkBlockedError):
+        stored_pin_relogin(Authenticator(http), store)(session)
+    assert store.load_pin(session.email) == "1234"
