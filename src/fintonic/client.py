@@ -12,6 +12,7 @@ import httpx
 from fintonic.aggregation import AggregationStatus, evaluate
 from fintonic.config import API_BASE, BFF_BASE
 from fintonic.errors import InputError, NotLoggedInError, SessionExpiredError, raise_for_response
+from fintonic.headers import auth_headers
 from fintonic.http import build_http_client
 from fintonic.models import BankRegistry, Category, Position, Product, Transaction, TransactionDateRange
 from fintonic.session import Session
@@ -87,11 +88,7 @@ class FintonicClient:
         return response.json() if response.content else None
 
     def _send(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        headers = {
-            "authorization": f"Bearer {self._session.access_token}",
-            "device-uuid": self._session.device_uuid or "",
-        }
-        return self._http.request(method, url, headers=headers, **kwargs)
+        return self._http.request(method, url, headers=auth_headers(self._session), **kwargs)
 
     def _refresh_session(self) -> None:
         if not self._relogin:

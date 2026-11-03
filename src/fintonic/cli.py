@@ -12,13 +12,21 @@ from typing import Annotated
 import httpx
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from fintonic.auth import Authenticator, stored_pin_relogin
 from fintonic.client import PRODUCT_ENDPOINTS, FintonicClient
-from fintonic.errors import DeviceVerificationRequired, FintonicError, InputError, NotLoggedInError
+from fintonic.errors import (
+    DeviceVerificationRequired,
+    FintonicError,
+    InputError,
+    NotLoggedInError,
+    SessionExpiredError,
+)
 from fintonic.http import build_http_client
 from fintonic.models import Category, Transaction, cents_to_decimal
 from fintonic.output import OutputFormat, format_eur, print_json, render
+from fintonic.session import Session
 from fintonic.split import parse_part
 from fintonic.stores import SessionStore, StoreKind, resolve_store
 from fintonic.summary import month_range, summarize
@@ -26,6 +34,9 @@ from fintonic.summary import month_range, summarize
 # Never render locals in tracebacks: frames hold the PIN and tokens.
 app = typer.Typer(no_args_is_help=True, help="CLI no oficial para Fintonic.", pretty_exceptions_show_locals=False)
 err = Console(stderr=True)
+
+# Logout on the server is best-effort; don't keep the user waiting a full request timeout.
+LOGOUT_TIMEOUT = 15.0
 
 FormatOpt = Annotated[OutputFormat, typer.Option("--format", "-f", help="Formato de salida.")]
 
@@ -164,16 +175,42 @@ def verify(code: Annotated[str, typer.Argument(help="Código recibido por SMS.")
 def logout(
     forget_device: Annotated[bool, typer.Option(help="Olvidar también el dispositivo (pedirá SMS otra vez).")] = False,
 ) -> None:
-    """Cierra la sesión local y borra el PIN guardado."""
+    """Cierra la sesión en Fintonic y en local, y borra el PIN guardado."""
     store = _store()
     session = store.load()
     if session:
+        # Local state goes first so it is cleared even if the server call hangs or fails.
         store.delete_pin(session.email)
         if forget_device:
             store.clear()
         else:
             store.save(session.without_tokens())
+        _server_logout(session)
     err.print("Sesión cerrada.")
+
+
+def _server_logout(session: Session) -> None:
+    """Best-effort `/oidc/logout`: failures only warn, the local session is already gone."""
+    if not session.refresh_token:
+        if session.access_token:
+            err.print(
+                "[yellow]Esta sesión se guardó con una versión anterior y no tiene refresh_token: solo se cierra "
+                "en local (el token de Fintonic caducará solo en 30 min como mucho).[/yellow]"
+            )
+        return
+    try:
+        with build_http_client(timeout=LOGOUT_TIMEOUT) as http:
+            Authenticator(http).logout(session)
+    except SessionExpiredError:
+        err.print("[yellow]Fintonic ha rechazado el cierre de sesión (token caducado o ya invalidado).[/yellow]")
+    except FintonicError as exc:
+        _warn_server_logout(escape(str(exc)))
+    except httpx.HTTPError as exc:
+        _warn_server_logout(f"error de red: {type(exc).__name__}")
+
+
+def _warn_server_logout(reason: str) -> None:
+    err.print(f"[yellow]No se ha podido cerrar la sesión en Fintonic ({reason}); la local sí se ha borrado.[/yellow]")
 
 
 @app.command()

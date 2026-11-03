@@ -31,6 +31,22 @@ def test_sends_auth_and_device_headers(mock_api: respx.MockRouter, http: httpx.C
     headers = route.calls.last.request.headers
     assert headers["authorization"] == f"Bearer {session.access_token}"
     assert headers["device-uuid"] == session.device_uuid
+    assert "finia_token" not in headers  # sessions from before these headers keep working
+    assert "x-fintonic-user-code" not in headers
+
+
+def test_sends_finia_token_and_user_code(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    route = mock_api.get(f"{API}/rest/user/profile").mock(return_value=httpx.Response(200, json={}))
+    FintonicClient(replace(session, finia_token="ft", user_code="uc"), http=http).profile()
+    headers = route.calls.last.request.headers
+    assert headers["finia_token"] == "ft"
+    assert headers["x-fintonic-user-code"] == "uc"
+
+
+def test_unverified_device_is_not_sent(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    route = mock_api.get(f"{API}/rest/user/profile").mock(return_value=httpx.Response(200, json={}))
+    FintonicClient(replace(session, device_verified=False), http=http).profile()
+    assert "device-uuid" not in route.calls.last.request.headers
 
 
 def test_transactions_paginate_until_count(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:

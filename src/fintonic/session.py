@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -26,19 +26,27 @@ def jwt_expiry(token: str) -> datetime | None:
 class Session:
     """Login state.
 
-    There is no refresh token: finapi exposes no refresh endpoint (verified Nov 2026) and the
-    Keycloak issuer is not publicly reachable, so renewal means logging in again.
+    `refresh_token` is kept only to invalidate the session server-side on logout
+    (`POST /oidc/logout`). It cannot renew the access token: neither finapi nor the Android
+    app has a refresh endpoint (the app re-logs in with the stored PIN, like `--remember`).
+
+    `finia_token` and `user_code` come from the login response headers and are sent on every
+    request, as the Android app does. Sessions saved by older versions lack them and still load.
     """
 
     email: str
-    access_token: str | None = None
+    access_token: str | None = field(default=None, repr=False)
     device_uuid: str | None = None
     device_verified: bool = False
+    refresh_token: str | None = field(default=None, repr=False)
+    finia_token: str | None = field(default=None, repr=False)
+    user_code: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
+        """Tolerate sessions from other versions: missing fields default, unknown ones are dropped."""
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in raw.items() if k in known})  # drops legacy `refresh_token`
+        return cls(**{k: v for k, v in raw.items() if k in known})
 
     @property
     def expires_at(self) -> datetime | None:
@@ -55,7 +63,7 @@ class Session:
 
     def without_tokens(self) -> Session:
         """Logout keeps the device so the next login can skip SMS verification."""
-        return replace(self, access_token=None)
+        return replace(self, access_token=None, refresh_token=None, finia_token=None)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))

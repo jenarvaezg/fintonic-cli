@@ -7,7 +7,9 @@ BFF_BASE = "https://fintonic-pfm-bff.fintonic.com"
 API_VERSION = "7"
 ACCEPT = f"application/vnd.fintonic-v{API_VERSION}+json"
 
-# Cloudflare sits in front of the API, so present ourselves like the web app does.
+# Cloudflare sits in front of the API, so present ourselves like the web app does. We keep the
+# browser User-Agent rather than the Android one (`FinAndroid-spain/...`) because the rest of
+# our fingerprint (origin, referer, login flow) is the web's; mixing both would stand out more.
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"

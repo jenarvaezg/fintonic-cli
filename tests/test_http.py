@@ -1,6 +1,7 @@
 import httpx
 import respx
 
+from fintonic.http import build_http_client
 from tests.conftest import API
 
 
@@ -52,3 +53,8 @@ def test_default_headers_mimic_web_app(mock_api: respx.MockRouter, http: httpx.C
     assert sent["accept"] == "application/vnd.fintonic-v7+json"
     assert sent["psd2_support"] == "true"
     assert "Chrome" in sent["user-agent"]
+
+
+def test_default_timeout_matches_android_app() -> None:
+    with build_http_client() as client:
+        assert client.timeout == httpx.Timeout(60.0)

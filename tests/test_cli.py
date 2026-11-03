@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -125,6 +126,7 @@ def test_login_with_sms(mock_api: respx.MockRouter, monkeypatch: pytest.MonkeyPa
     assert result.exit_code == 0, result.output
     assert sms.called
     assert memory.session and memory.session.device_verified
+    assert memory.session.refresh_token
     assert memory.load_pin("user@example.com") == "1234"
 
 
@@ -198,6 +200,60 @@ def test_logout_keeps_device(store: MemorySessionStore, session: Session) -> Non
     assert store.session.access_token is None
     assert store.session.device_uuid == DEVICE
     assert store.load_pin(session.email) is None
+
+
+def test_logout_invalidates_session_on_server(
+    mock_api: respx.MockRouter, store: MemorySessionStore, session: Session
+) -> None:
+    store.save(replace(session, refresh_token="rt", finia_token="ft"))
+    route = mock_api.post(f"{API}/oidc/logout").mock(return_value=httpx.Response(200, json={"data": None}))
+
+    result = runner.invoke(cli.app, ["logout"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(route.calls.last.request.content) == {"refresh_token": "rt"}
+    assert store.session is not None
+    assert (store.session.access_token, store.session.refresh_token, store.session.finia_token) == (None, None, None)
+    assert "rt" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("response", "warning"),
+    [
+        (httpx.Response(500, json={"error": "boom"}), "No se ha podido cerrar la sesión en Fintonic"),
+        (httpx.ConnectError("offline"), "error de red: ConnectError"),
+        (httpx.Response(401, json={"error": "Invalid Token"}), "ha rechazado el cierre"),
+    ],
+)
+def test_logout_server_failure_still_clears_local(
+    mock_api: respx.MockRouter,
+    store: MemorySessionStore,
+    session: Session,
+    response: httpx.Response | Exception,
+    warning: str,
+) -> None:
+    store.save(replace(session, refresh_token="rt"))
+    store.save_pin(session.email, "1234")
+    route = mock_api.post(f"{API}/oidc/logout")
+    if isinstance(response, Exception):
+        route.mock(side_effect=response)
+    else:
+        route.mock(return_value=response)
+
+    result = runner.invoke(cli.app, ["logout", "--forget-device"])
+
+    assert result.exit_code == 0, result.output
+    assert warning in " ".join(result.stderr.split())
+    assert "Sesión cerrada." in result.stderr
+    assert store.session is None
+    assert store.load_pin(session.email) is None
+
+
+def test_logout_legacy_session_warns_local_only(store: MemorySessionStore) -> None:
+    result = runner.invoke(cli.app, ["logout"])  # session fixture has no refresh_token; no route mocked
+    assert result.exit_code == 0, result.output
+    assert "solo se cierra en local" in " ".join(result.stderr.split())
+    assert store.session is not None and store.session.access_token is None
 
 
 def test_status(store: MemorySessionStore) -> None:

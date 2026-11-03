@@ -16,7 +16,7 @@ RETRY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 DEFAULT_RETRIES = 4
 DEFAULT_BACKOFF = 0.5  # 0.5s, 1s, 2s, 4s (+ jitter)
-DEFAULT_TIMEOUT = 30.0
+DEFAULT_TIMEOUT = 60.0  # read/write timeouts of the Android app (`mc/c.java`)
 
 
 def build_retry(retries: int = DEFAULT_RETRIES, backoff: float = DEFAULT_BACKOFF) -> Retry:

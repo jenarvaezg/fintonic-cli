@@ -1,5 +1,6 @@
 import json
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 import keyring
@@ -68,11 +69,52 @@ def test_file_store_empty(tmp_path: Path) -> None:
     assert store.load_pin("x") is None
 
 
-def test_legacy_refresh_token_is_ignored(tmp_path: Path, session: Session) -> None:
+def test_session_saved_without_new_fields_still_loads(tmp_path: Path, session: Session) -> None:
     path = tmp_path / "s.json"
-    legacy = {"email": session.email, "access_token": session.access_token, "refresh_token": "old"}
+    legacy = {
+        "email": session.email,
+        "access_token": session.access_token,
+        "device_uuid": session.device_uuid,
+        "device_verified": True,
+    }
     path.write_text(json.dumps({"session": legacy}))
-    assert FileSessionStore(path).load() == Session(session.email, session.access_token)
+    loaded = FileSessionStore(path).load()
+    assert loaded == session
+    assert loaded.refresh_token is None and loaded.finia_token is None and loaded.user_code is None
+
+
+def test_session_keeps_refresh_token_and_drops_unknown_keys(tmp_path: Path, session: Session) -> None:
+    path = tmp_path / "s.json"
+    raw = {"email": session.email, "access_token": session.access_token, "refresh_token": "rt", "future": 1}
+    path.write_text(json.dumps({"session": raw}))
+    assert FileSessionStore(path).load() == Session(session.email, session.access_token, refresh_token="rt")
+
+
+def test_new_session_fields_round_trip(tmp_path: Path, session: Session) -> None:
+    full = replace(session, refresh_token="rt", finia_token="ft", user_code="uc")
+    store = FileSessionStore(tmp_path / "s.json")
+    store.save(full)
+    assert store.load() == full
+    assert Session.from_json(full.to_json()) == full
+
+
+def test_session_repr_hides_tokens(session: Session) -> None:
+    full = replace(session, refresh_token="secret-rt", finia_token="secret-ft")
+    text = repr(full)
+    assert "secret" not in text
+    assert session.access_token not in text  # type: ignore[operator]
+
+
+def test_without_tokens_drops_every_token_but_keeps_identity(session: Session) -> None:
+    full = replace(session, refresh_token="rt", finia_token="ft", user_code="uc")
+    cleared = full.without_tokens()
+    assert (cleared.access_token, cleared.refresh_token, cleared.finia_token) == (None, None, None)
+    assert (cleared.email, cleared.device_uuid, cleared.device_verified, cleared.user_code) == (
+        session.email,
+        session.device_uuid,
+        True,
+        "uc",
+    )
 
 
 def test_keyring_store(fake_keyring: FakeKeyring, session: Session) -> None:
