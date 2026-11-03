@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import socket
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -72,6 +73,13 @@ def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(socket.socket, "connect", refuse)
     monkeypatch.setattr(socket.socket, "connect_ex", refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_fintonic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The user's real FINTONIC_* (PIN, email, store…) must not leak into tests or their output."""
+    for name in [n for n in os.environ if n.startswith("FINTONIC_")]:
+        monkeypatch.delenv(name)
 
 
 @pytest.fixture(autouse=True)

@@ -240,8 +240,11 @@ def test_cli_refresh_reports_2fa(mock_api: respx.MockRouter, store: MemorySessio
     mock_api.get(f"{BFF}/openbanking/aggregations/").mock(
         return_value=httpx.Response(200, json=[_agg("2091", "IN_PROGRESS", "2FA")])
     )
-    result = runner.invoke(cli.app, ["refresh"])
-    assert result.exit_code == 0, result.output
+    mock_api.get(f"{API}/rest/bankRegistries").mock(
+        return_value=httpx.Response(200, json={"data": {"bankRegistries": [{"bankId": "2091"}]}})
+    )
+    result = runner.invoke(cli.app, ["refresh", "--no-2fa"])
+    assert result.exit_code == 3, result.output  # 2FA pending: the bank did not sync
     assert "2FA" in result.stderr
 
 

@@ -30,7 +30,7 @@ fintonic transactions --unclassified | --direct-debit
 fintonic summary --month 2026-10 [--group parent] [--exclude-bank 2091] [--exclude-product <id>] [--local]
 fintonic summary --budgets [--budgets-file budgets.toml] [--fail-over-budget]   # presupuestos locales (ver abajo)
 fintonic cashflow --months 12 [--to 2026-10] [--category G0898|G0800]   # ingresos/gastos/neto por mes
-fintonic transfers --month 2026-10 [--from … --to …] [--days 3] [--apply [--yes]]   # traspasos mal categorizados
+fintonic transfers --month 2026-10 [--from … --to …] [--days 3] [--apply [--yes [--max-changes 10]]]   # traspasos mal categorizados
 fintonic mandates [<mandateId>]                # recibos domiciliados detectados por Fintonic
 fintonic tx show <id>                          # detalle: fechas, producto, partes si está dividido
 fintonic tx suggest <id>                       # categorías que propone Fintonic, con probabilidad
@@ -42,7 +42,7 @@ fintonic bank-2fa 0182                         # banco con aprobación en su app
 # Escritura (modifica tu cuenta). Con --dry-run muestran «antes → después» sin escribir nada
 fintonic products hide <id>... | --bank 0182 [--kind credit_card]   # ocultar (como desactivar en la app)
 fintonic products show <id>... | --bank 0182 [--kind credit_card]
-fintonic tx set-category <id> G0898 [--similar]  # --similar crea regla para movimientos parecidos
+fintonic tx set-category <id> G0898 [--similar]  # --similar crea regla para movimientos parecidos (sin undo)
 fintonic tx split <id> G0898:85 G0101:195       # 2-3 partes en euros positivos; deben sumar el total
 fintonic tx describe <id> "Cena cumple"
 fintonic tx note <id> "pagó Ana la mitad"
@@ -89,7 +89,7 @@ G0898 = 120.50   # solo "Restaurante"
 
 ### Traspasos entre tus cuentas
 
-`transfers` busca pares cargo/abono del mismo importe absoluto en dos productos distintos con ±`--days` días (3 por defecto) en los que al menos un lado no está en una categoría no computable `N*`, y propone pasarlos a `N0102` ("Que realices entre tus cuentas"). Cada movimiento entra en un solo par (gana la fecha más cercana) y los traspasos que ya están en `N*` en los dos lados no se proponen ni se reutilizan. No se tienen en cuenta los movimientos divididos. Sin `--apply` solo lista; con `--apply` pide confirmación (`--yes` para omitirla) y recategoriza los lados que no son `N*`.
+`transfers` busca pares cargo/abono del mismo importe absoluto en dos productos distintos con ±`--days` días (3 por defecto) en los que al menos un lado no está en una categoría no computable `N*`, y propone pasarlos a `N0102` ("Que realices entre tus cuentas"). Cada movimiento entra en un solo par (gana la fecha más cercana) y los traspasos que ya están en `N*` en los dos lados no se proponen ni se reutilizan. No se tienen en cuenta los movimientos divididos. Sin `--apply` solo lista; con `--apply` muestra siempre la lista, pide confirmación (`--yes` para omitirla) y recategoriza los lados que no son `N*`. Con `--yes` no aplica nada si hay más de `--max-changes` movimientos que recategorizar (10 por defecto).
 
 ## Como librería
 
@@ -109,7 +109,7 @@ with FintonicClient(store.load(), store=store) as client:
 - **Logout en servidor**: `fintonic logout` borra primero la sesión local y después invalida el `refresh_token` con `/oidc/logout`. Es best-effort: si falla la red o Fintonic, avisa pero la sesión local ya está borrada. Las sesiones guardadas con versiones anteriores no tienen `refresh_token` y solo se cierran en local. Ojo: el access token ya emitido **sigue siendo válido hasta que caduca** (≤ 30 min), porque la API valida el JWT sin consultar la sesión (verificado en #3; la app oficial se comporta igual).
 - **Cabeceras como la app Android** (`mc/c.java`): `finia_token` y `x-fintonic-user-code` (vienen en las cabeceras `finia_token` y `user-code` del login) en todas las peticiones, y `DEVICE-UUID` solo con el dispositivo verificado (y en `device/provisions` y `device/verification`, como la web). Timeouts de 60 s. El User-Agent sigue siendo el de Chrome: Cloudflare está delante de la API y el resto de cabeceras (`origin`, `referer`) son las de la web.
 - **Movimientos divididos**: `weightedCategories` son céntimos con signo por categoría que suman el total; `summary` reparte cada parte en su categoría. Las categorías `N*` (no computables: traspasos, inversiones, liquidación de tarjeta) se excluyen.
-- **Filtros en servidor**: `transactions` usa `list/pageable` (el de la app Android) y todos los filtros los aplica Fintonic. `product_id` de un movimiento es el `ccc` de la cuenta o el número de tarjeta, así que `--product` envía `ccc` o `cardNumber`; el resto de productos (préstamos, fondos…) no tienen movimientos.
+- **Filtros en servidor**: `transactions` usa `list/pageable` (el de la app Android) y todos los filtros los aplica Fintonic. `product_id` de un movimiento es el `ccc` de la cuenta o el número de tarjeta, así que `--product` envía `ccc` o `cardNumber`; el resto de productos (préstamos, fondos…) no tienen movimientos. En JSON (`transactions`, `tx show`, `transfers`) cada movimiento lleva además `product_ref`, el `id` de `fintonic products` (el que acepta `--product`), y `product`, su nombre.
 - **Importes con signo**: `--min`/`--max`/`--amount` van en euros (`12,50` o `12.50`) y se envían en céntimos con signo; los gastos son negativos, así que `--max -100` son gastos de 100 € o más.
 - **Dispositivo persistente**: se reenvía el `deviceUUID` verificado en cada login, así que el SMS solo se pide la primera vez.
 - Importes en **céntimos** (`quantity`); los modelos exponen `amount` como `Decimal` en euros.
@@ -162,6 +162,10 @@ Escritura (`POST`/`PUT` salvo que se indique; nunca se reintentan):
 | PUT | `/openbanking/aggregations/{aggregationId}/2fa` | `{otp}` con el código; `{}` confirma una aprobación hecha en la app del banco |
 
 Reglas de 2FA (de la app Android): espera 2FA si `status.detail == "2FA"`; `reason` `WAITING_PARAM` pide código y `BACKGROUND_WAITING_PARAM` aprobación en la app del banco; `detail == "INVALID_2FA"` o `reason` `INVALID_*`/`TIMEOUT_*`/`CANCELLED_*` indica respuesta rechazada o caducada. `refresh` pregunta el código en una terminal interactiva (hasta 3 intentos por banco); con `--no-2fa` o sin terminal solo avisa.
+
+Justo después de pedir la actualización, un banco puede seguir mostrando el estado final de la sincronización anterior. Por eso `refresh` guarda antes el `lastUpdateDate` de `/rest/bankRegistries` y solo da un banco por actualizado si lo ha visto sincronizar (`IN_PROGRESS` o 2FA) o si esa fecha ha avanzado; si no, lo sigue esperando hasta 20 s y luego avisa de que no consta que haya sincronizado. Un banco sin entrada en `bankRegistries` no tiene fecha con la que comparar y se acepta como antes.
+
+Códigos de salida de `refresh` y `bank-2fa` (al esperar): **0** todos actualizados; **2** alguno seguía sincronizando al agotar `--timeout`; **3** alguno acabó con error, con 2FA pendiente o rechazado, o sin constancia de haber sincronizado. Con `--no-wait`, 0 si la petición se aceptó.
 
 **Fuera de alcance a propósito**: `PUT /openbanking/aggregations/{id}/credential` (actualizar usuario/contraseña del banco). Este CLI no maneja contraseñas bancarias; cámbialas en la app.
 

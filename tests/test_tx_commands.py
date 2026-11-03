@@ -167,6 +167,30 @@ def test_set_category_similar_is_logged_as_rule(
     assert log.records()[0].rule
 
 
+def test_undo_after_similar_refuses_without_writing(
+    mock_api: respx.MockRouter, store: MemorySessionStore, log: ChangeLog
+) -> None:
+    _serve_txs(mock_api, make_tx(1, quantity=-1000))
+    mock_api.post(f"{API}/rest/transaction/tx0001/applyUserRule").mock(return_value=httpx.Response(200))
+    writes = mock_api.post(url__regex=rf"{API}/rest/transaction/tx0001/(category|split)")
+    assert runner.invoke(cli.app, ["tx", "set-category", "tx0001", "G0101", "--similar"]).exit_code == 0
+    _serve_txs(mock_api, make_tx(1, quantity=-1000, categorization=_cats({"G0101": -1000})))
+
+    result = runner.invoke(cli.app, ["tx", "undo", "tx0001"])
+
+    assert isinstance(result.exception, UndoRefused)
+    assert "regla" in str(result.exception)
+    assert not writes.called
+    assert len(log.records()) == 1
+
+
+def test_similar_and_undo_help_say_the_rule_stays() -> None:
+    similar = runner.invoke(cli.app, ["tx", "set-category", "--help"], terminal_width=200)
+    undo = runner.invoke(cli.app, ["tx", "undo", "--help"], terminal_width=200)
+    assert "no puede deshacer" in " ".join(similar.output.split())
+    assert "set-category --similar" in " ".join(undo.output.split())
+
+
 def test_bulk_mark_read_logs_each_unread(mock_api: respx.MockRouter, store: MemorySessionStore, log: ChangeLog) -> None:
     mock_api.get(f"{API}/rest/transaction/list/pageable", params={"bankId": "0182"}).mock(
         return_value=httpx.Response(200, json={"content": [make_tx(1), make_tx(2)], "last": True})

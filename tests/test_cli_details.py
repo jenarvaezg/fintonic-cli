@@ -68,6 +68,7 @@ def test_show_split_transaction_json(mock_api: respx.MockRouter, store: MemorySe
     body = json.loads(result.stdout)
     assert body["amount"] == "-280.00"
     assert body["product"] == "Nómina"
+    assert body["product_ref"] == "acc1"
     assert body["category"] == "Restaurante"
     assert body["operationDate"] == "2026-10-29"
     assert body["parts"] == [
@@ -86,7 +87,7 @@ def test_show_table_fields(mock_api: respx.MockRouter, store: MemorySessionStore
     assert fields["importe"] == "-10.50"
     assert fields["nota"] == "nota"
     assert fields["dividido"] == "no"
-    assert fields["producto"] == "Nómina"
+    assert fields["producto"] == "Nómina (acc1)"  # name plus the id `--product` takes
     assert fields["fecha operación"] == "2026-10-29"
 
 
