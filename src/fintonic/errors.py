@@ -115,6 +115,16 @@ def _is_cloudflare_block(response: httpx.Response) -> bool:
     return "cf-mitigated" in response.headers or "text/html" in response.headers.get("content-type", "")
 
 
+def raise_for_problem(body: object, path: str) -> None:
+    """The BFF stats endpoints may answer 200 with an RFC 7807 problem body instead of data."""
+    if isinstance(body, dict) and "status" in body and "title" in body:
+        try:
+            status = int(body["status"])
+        except (TypeError, ValueError):
+            status = 0
+        raise ApiError(status, str(body.get("detail") or body["title"]), path)
+
+
 def raise_for_response(response: httpx.Response) -> None:
     if response.is_success:
         return

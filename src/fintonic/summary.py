@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from fintonic.errors import InputError
-from fintonic.models import Category, Transaction
+from fintonic.models import Category, CategoryNet, Transaction
 
 
 @dataclass(frozen=True)
@@ -66,19 +66,40 @@ def summarize(
     *,
     group_by_parent: bool = False,
 ) -> Summary:
+    """Aggregate transactions locally; each split part counts once in its category."""
+    entries = ((cid, cents, 1) for tx in transactions for cid, cents in tx.category_amounts.items())
+    return _aggregate(entries, categories, group_by_parent=group_by_parent)
+
+
+def summarize_nets(
+    nets: Iterable[CategoryNet],
+    categories: Mapping[str, Category],
+    *,
+    group_by_parent: bool = False,
+) -> Summary:
+    """Same result as `summarize`, from the BFF's per-category totals (`stats/range/net/categories`)."""
+    entries = ((n.category_id, n.net, n.num_transactions) for n in nets if n.num_transactions)
+    return _aggregate(entries, categories, group_by_parent=group_by_parent)
+
+
+def _aggregate(
+    entries: Iterable[tuple[str, int, int]],
+    categories: Mapping[str, Category],
+    *,
+    group_by_parent: bool,
+) -> Summary:
     amounts: dict[str, int] = defaultdict(int)
     counts: dict[str, int] = defaultdict(int)
     excluded = 0
 
-    for tx in transactions:
-        for category_id, cents in tx.category_amounts.items():
-            if not _is_computable(category_id, categories):
-                excluded += cents
-                continue
-            category = categories.get(category_id)
-            key = category.parent_id if (group_by_parent and category) else category_id
-            amounts[key] += cents
-            counts[key] += 1
+    for category_id, cents, count in entries:
+        if not _is_computable(category_id, categories):
+            excluded += cents
+            continue
+        category = categories.get(category_id)
+        key = category.parent_id if (group_by_parent and category) else category_id
+        amounts[key] += cents
+        counts[key] += count
 
     rows = tuple(
         sorted(
@@ -92,7 +113,7 @@ def summarize(
                 )
                 for key, amount in amounts.items()
             ),
-            key=lambda r: (r.kind != "I", r.amount if r.kind != "I" else -r.amount),
+            key=lambda r: (r.kind != "I", r.amount if r.kind != "I" else -r.amount, r.category_id),
         )
     )
     return Summary(rows=rows, excluded_non_computable=excluded)
