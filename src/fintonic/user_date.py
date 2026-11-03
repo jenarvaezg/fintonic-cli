@@ -11,9 +11,10 @@ Evidence from the decompiled Android app (only client of this endpoint; the web 
   read with `getTimeInMillis()`. So the long is **epoch milliseconds** in the **device timezone**
   (Europe/Madrid for Fintonic users) at hour 0 (minutes/seconds leak from "now": an app quirk).
 
-We send 12:00 Europe/Madrid instead of 00:xx: it is the same calendar day whether the server
-reads the instant in Madrid time (like the app) or truncates it in UTC, which hour 0 would not
-survive (00:xx Madrid is the previous day in UTC). Unverified against a real account (#3).
+Verified against a real account (#3): the server turns the instant into a day by rounding **up**
+to the next UTC midnight (00:00Z → that day; 23:00Z the day before → that day; 11:00Z → the next
+day). Midnight Europe/Madrid, like the app, always lands 1-2 h before the UTC day boundary, so it
+maps to the intended day in winter and summer time.
 """
 
 from __future__ import annotations
@@ -22,9 +23,9 @@ from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 FINTONIC_TZ = ZoneInfo("Europe/Madrid")
-_NOON = time(12, 0)
+_MIDNIGHT = time(0, 0)
 
 
 def user_date_millis(day: date) -> int:
-    """Epoch milliseconds for `day` at 12:00 Europe/Madrid."""
-    return int(datetime.combine(day, _NOON, tzinfo=FINTONIC_TZ).timestamp() * 1000)
+    """Epoch milliseconds for `day` at 00:00 Europe/Madrid (what the Android app sends)."""
+    return int(datetime.combine(day, _MIDNIGHT, tzinfo=FINTONIC_TZ).timestamp() * 1000)

@@ -1129,14 +1129,12 @@ def tx_set_date(
     day: Annotated[str, typer.Argument(help="Fecha nueva YYYY-MM-DD.", metavar="YYYY-MM-DD")],
     dry_run: DryRunOpt = False,
 ) -> None:
-    """[EXPERIMENTAL] Cambia la fecha del movimiento. Sin verificar en una cuenta real: compruébala con `tx show`."""
+    """Cambia la fecha del movimiento (la que se usa en listados y resúmenes)."""
     new_day = _parse_day(day)
     with _client() as client:
         tx = client.transaction(tx_id)
         write = partial(client.set_user_date, tx_id, new_day)
         _change(tx, Field.user_date, new_day.isoformat(), write, command="set-date", dry_run=dry_run)
-    if not dry_run:
-        err.print("[yellow]Experimental: comprueba la fecha con `fintonic tx show`.[/yellow]")
     _finish(dry_run)
 
 
