@@ -1,0 +1,41 @@
+[project]
+name = "fintonic"
+version = "0.1.0"
+description = "Cliente y CLI no oficiales para la API de Fintonic"
+readme = "README.md"
+authors = [
+    { name = "Jose Enrique Narváez Gago", email = "jenarvaezg@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "httpx-retries>=0.6.0",
+    "keyring>=25.7.0",
+    "pydantic>=2.14.2",
+    "rich>=15.0.0",
+    "typer>=0.27.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "respx>=0.23.1",
+    "ruff>=0.17.3",
+]
+
+[project.scripts]
+fintonic = "fintonic.cli:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
