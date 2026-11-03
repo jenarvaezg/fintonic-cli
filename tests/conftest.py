@@ -5,6 +5,7 @@ import json
 import socket
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -71,6 +72,14 @@ def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(socket.socket, "connect", refuse)
     monkeypatch.setattr(socket.socket, "connect_ex", refuse)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Keep the write change log (`$XDG_STATE_HOME/fintonic/changes.jsonl`) out of the real home."""
+    state = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    return state
 
 
 @pytest.fixture

@@ -17,6 +17,7 @@ from fintonic.models import BankRegistry, Category, Position, Product, Transacti
 from fintonic.session import Session
 from fintonic.split import build_split_body
 from fintonic.stores import SessionStore
+from fintonic.user_date import user_date_millis
 
 PRODUCT_ENDPOINTS: Mapping[str, str] = {
     "account": "rest/account/listAccounts",
@@ -74,6 +75,11 @@ class FintonicClient:
         """Not retried by the transport: writes must not be replayed blindly."""
         base = BFF_BASE if bff else API_BASE
         return self._request("POST", f"{base}/{path.lstrip('/')}", json=body)
+
+    def delete(self, path: str, *, bff: bool = False) -> Any:
+        """Not retried by the transport either (only GET/HEAD/OPTIONS are)."""
+        base = BFF_BASE if bff else API_BASE
+        return self._request("DELETE", f"{base}/{path.lstrip('/')}")
 
     def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         refreshed = self._session.is_expired()
@@ -186,6 +192,18 @@ class FintonicClient:
     def mark_all_read(self, bank_id: str | None = None) -> None:
         self.post(f"rest/transaction/markAsReadByBank/{bank_id}" if bank_id else "rest/transaction/markAsReadByUser")
 
+    def mark_unread(self, tx_id: str) -> None:
+        """Android app only (`TransactionRetrofit.markAsUnread`); the web cannot unmark."""
+        self.delete(f"rest/transaction/{tx_id}/read")
+
+    def mark_product_read(self, product: Product) -> None:
+        """Mark every movement of one account (by `ccc`) or card (by `cardNumber`) as read (Android app)."""
+        self.post(product_read_path(product))
+
+    def set_user_date(self, tx_id: str, day: date) -> None:
+        """Change the movement's date (Android app only). See `fintonic.user_date` for the encoding."""
+        self.post(f"rest/transaction/{tx_id}/userDate", {"userDate": str(user_date_millis(day))})
+
     def transaction_date_range(self) -> TransactionDateRange:
         return TransactionDateRange.model_validate(self.get("rest/transaction/olderNewerTransactionUserDate"))
 
@@ -237,6 +255,15 @@ class FintonicClient:
             offset += len(items)
             if not items or offset >= int(body.get("count") or 0):
                 return
+
+
+def product_read_path(product: Product) -> str:
+    """Endpoint marking a whole account or card as read; raises `InputError` for other products."""
+    if product.kind == "account" and product.ccc:
+        return f"rest/transaction/markAsReadByAccount/{product.bank_id}/{product.ccc}"
+    if product.kind == "credit_card" and product.card_number:
+        return f"rest/transaction/markAsReadByCreditCard/{product.bank_id}/{product.card_number}"
+    raise InputError(f"Solo se pueden marcar por producto cuentas y tarjetas; {product.id} es {product.kind}.")
 
 
 def _compact(params: Mapping[str, Any]) -> dict[str, Any]:

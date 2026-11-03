@@ -217,6 +217,9 @@ def test_cli_split_rejects_bad_sum_before_calling_api(mock_api: respx.MockRouter
 
 def test_cli_set_category_validates_category(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
     mock_api.get(f"{API}/rest/category/tree").mock(return_value=httpx.Response(200, json=CATS))
+    mock_api.get(f"{API}/rest/transaction/listByIds").mock(
+        return_value=httpx.Response(200, json={"count": 1, "resultList": [make_tx(1, id="tx1")]})
+    )
     route = mock_api.post(f"{API}/rest/transaction/tx1/category").mock(return_value=httpx.Response(200))
 
     bad = runner.invoke(cli.app, ["tx", "set-category", "tx1", "G7777"])

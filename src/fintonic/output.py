@@ -12,6 +12,7 @@ from typing import Any
 
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from fintonic.models import cents_to_decimal
 
@@ -52,7 +53,7 @@ def render(rows: Sequence[dict[str, Any]], fmt: OutputFormat, *, title: str | No
     for col in columns:
         table.add_column(col, justify="right" if col in {"importe", "saldo", "amount"} else "left")
     for row in rows:
-        table.add_row(*("" if row.get(c) is None else str(row.get(c)) for c in columns))
+        table.add_row(*(Text("" if row.get(c) is None else str(row.get(c))) for c in columns))
     Console().print(table)
 
 

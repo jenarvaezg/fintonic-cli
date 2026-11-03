@@ -4,17 +4,30 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
+from functools import partial
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from fintonic.auth import Authenticator, stored_pin_relogin
-from fintonic.client import PRODUCT_ENDPOINTS, FintonicClient
+from fintonic.changelog import ChangeLog, ChangeRecord
+from fintonic.changes import (
+    LABELS,
+    Field,
+    current_value,
+    describe_value,
+    single_category,
+    split_categories,
+    write_value,
+)
+from fintonic.client import PRODUCT_ENDPOINTS, FintonicClient, product_read_path
 from fintonic.errors import DeviceVerificationRequired, FintonicError, InputError, NotLoggedInError
 from fintonic.http import build_http_client
 from fintonic.models import Category, Transaction, cents_to_decimal
@@ -22,6 +35,7 @@ from fintonic.output import OutputFormat, format_eur, print_json, render
 from fintonic.split import parse_part
 from fintonic.stores import SessionStore, StoreKind, resolve_store
 from fintonic.summary import month_range, summarize
+from fintonic.undo import no_history, plan_undo
 
 # Never render locals in tracebacks: frames hold the PIN and tokens.
 app = typer.Typer(no_args_is_help=True, help="CLI no oficial para Fintonic.", pretty_exceptions_show_locals=False)
@@ -84,8 +98,10 @@ def _local_time(moment: datetime | None) -> str:
 
 
 def _parse_date(value: str | None) -> date | None:
-    if not value:
-        return None
+    return _parse_day(value) if value else None
+
+
+def _parse_day(value: str) -> date:
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError as exc:
@@ -497,6 +513,59 @@ def tx_show(
     render([{"campo": k, "valor": v} for k, v in fields.items()], fmt, title=f"Movimiento {t.id}")
 
 
+DryRunOpt = Annotated[bool, typer.Option("--dry-run", help="Muestra qué cambiaría sin escribir nada.")]
+
+
+def _changelog() -> ChangeLog:
+    return ChangeLog()
+
+
+def _print_change(
+    tx_id: str, field: Field, before: Any, after: Any, cats: Mapping[str, Category] | None, *, dry_run: bool
+) -> None:
+    prefix = "[yellow](simulación)[/yellow] " if dry_run else ""
+    old, new = (escape(describe_value(field, v, cats)) for v in (before, after))
+    err.print(f"{prefix}{escape(tx_id)} · {LABELS[field]}: {old} → {new}", soft_wrap=True)
+
+
+def _record(tx: Transaction, field: Field, before: Any, after: Any, command: str, **extra: Any) -> None:
+    """Log a write the API already accepted; a no-op is skipped so it never hides the change before it."""
+    if before == after:
+        return
+    record = ChangeRecord(command=command, tx_id=tx.id, field=field, before=before, after=after, **extra)
+    try:
+        _changelog().append(record)
+    except OSError as exc:
+        err.print(
+            f"[yellow]El cambio en {escape(tx.id)} se ha hecho, pero no se ha podido registrar en el historial "
+            f"({type(exc).__name__}: {escape(str(exc))}); `tx undo` no lo verá.[/yellow]"
+        )
+
+
+def _change(
+    tx: Transaction,
+    field: Field,
+    after: Any,
+    write: Callable[[], None],
+    *,
+    command: str,
+    dry_run: bool,
+    cats: Mapping[str, Category] | None = None,
+    **extra: Any,
+) -> None:
+    """Show `before → after`; unless dry-run, write it and log it once the API accepted it."""
+    before = current_value(tx, field)
+    _print_change(tx.id, field, before, after, cats, dry_run=dry_run)
+    if dry_run:
+        return
+    write()
+    _record(tx, field, before, after, command, **extra)
+
+
+def _finish(dry_run: bool, message: str = "Hecho.") -> None:
+    err.print("Simulación: no se ha escrito nada." if dry_run else f"[green]{message}[/green]")
+
+
 @tx_app.command("set-category")
 def tx_set_category(
     tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
@@ -504,13 +573,22 @@ def tx_set_category(
     similar: Annotated[
         bool, typer.Option("--similar", help="Aplicar también a movimientos similares (crea regla).")
     ] = False,
+    dry_run: DryRunOpt = False,
 ) -> None:
     """Recategoriza un movimiento."""
+    category_id = category_id.upper()
     with _client() as client:
-        if category_id.upper() not in client.categories():
+        cats = client.categories()
+        if category_id not in cats:
             raise typer.BadParameter(f"La categoría {category_id} no existe.")
-        client.set_category(tx_id, category_id.upper(), apply_to_similar=similar)
-    err.print(f"[green]Movimiento {tx_id} → {category_id.upper()}[/green]")
+        tx = client.transaction(tx_id)
+        write = partial(client.set_category, tx_id, category_id, apply_to_similar=similar)
+        after = single_category(tx, category_id)
+        _change(tx, Field.category, after, write, command="set-category", dry_run=dry_run, cats=cats, rule=similar)
+    if similar:
+        verb = "se crearía" if dry_run else "se ha creado"
+        err.print(f"Además {verb} una regla para movimientos similares (no se puede deshacer con `tx undo`).")
+    _finish(dry_run)
 
 
 @tx_app.command("split")
@@ -519,6 +597,7 @@ def tx_split(
     parts: Annotated[
         list[str], typer.Argument(help="CATEGORIA:IMPORTE en euros positivos, p.ej. G0898:85 G0101:19,50")
     ],
+    dry_run: DryRunOpt = False,
 ) -> None:
     """Divide un movimiento en 2-3 categorías; las partes deben sumar el total."""
     parsed = [parse_part(p) for p in parts]
@@ -527,22 +606,39 @@ def tx_split(
         unknown = [cid for cid, _ in parsed if cid not in known]
         if unknown:
             raise typer.BadParameter(f"Categorías inexistentes: {', '.join(unknown)}")
-        client.split(client.transaction(tx_id), parsed)
-    err.print(f"[green]Movimiento {tx_id} dividido en {len(parsed)} partes.[/green]")
+        tx = client.transaction(tx_id)
+        after = split_categories(tx, parsed)  # validates the sum even with --dry-run
+        _change(
+            tx, Field.category, after, partial(client.split, tx, parsed), command="split", dry_run=dry_run, cats=known
+        )
+    _finish(dry_run, f"Movimiento {escape(tx_id)} dividido en {len(parsed)} partes.")
 
 
 @tx_app.command("describe")
-def tx_describe(tx_id: str, text: str) -> None:
+def tx_describe(
+    tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
+    text: Annotated[str, typer.Argument(help="Concepto nuevo.")],
+    dry_run: DryRunOpt = False,
+) -> None:
     """Cambia el concepto que se muestra."""
     with _client() as client:
-        client.set_description(tx_id, text)
+        tx = client.transaction(tx_id)
+        write = partial(client.set_description, tx_id, text)
+        _change(tx, Field.description, text, write, command="describe", dry_run=dry_run)
+    _finish(dry_run)
 
 
 @tx_app.command("note")
-def tx_note(tx_id: str, text: str) -> None:
+def tx_note(
+    tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
+    text: Annotated[str, typer.Argument(help="Nota nueva.")],
+    dry_run: DryRunOpt = False,
+) -> None:
     """Añade o cambia la nota del movimiento."""
     with _client() as client:
-        client.set_note(tx_id, text)
+        tx = client.transaction(tx_id)
+        _change(tx, Field.note, text, partial(client.set_note, tx_id, text), command="note", dry_run=dry_run)
+    _finish(dry_run)
 
 
 @tx_app.command("mark-read")
@@ -550,19 +646,124 @@ def tx_mark_read(
     tx_ids: Annotated[list[str] | None, typer.Argument(help="ids a marcar como leídos.")] = None,
     all_: Annotated[bool, typer.Option("--all", help="Marcar todos los movimientos.")] = False,
     bank: Annotated[str | None, typer.Option("--bank", help="Marcar todos los de este banco.")] = None,
+    product: Annotated[
+        str | None, typer.Option("--product", help="Marcar todos los de esta cuenta o tarjeta (id de `products`).")
+    ] = None,
+    dry_run: DryRunOpt = False,
 ) -> None:
-    """Marca como leídos unos movimientos, todos los de un banco (--bank) o todos (--all)."""
-    if tx_ids and (all_ or bank):
-        raise typer.BadParameter("Usa ids, --bank o --all, pero no ids junto con --bank/--all.")
-    if not tx_ids and not all_ and not bank:
-        raise typer.BadParameter("Indica ids, --bank o --all.")
+    """Marca como leídos unos movimientos, los de un banco (--bank), producto (--product) o todos (--all)."""
+    targets = sum(bool(t) for t in (tx_ids, all_, bank, product))
+    if targets > 1:
+        raise typer.BadParameter("Usa solo una opción: ids, --bank, --product o --all.")
+    if not targets:
+        raise typer.BadParameter("Indica ids, --bank, --product o --all.")
     with _client() as client:
         if tx_ids:
             for tx_id in tx_ids:
-                client.mark_read(tx_id)
+                tx = client.transaction(tx_id)
+                _change(tx, Field.read, True, partial(client.mark_read, tx_id), command="mark-read", dry_run=dry_run)
         else:
-            client.mark_all_read(bank)
-    err.print("[green]Hecho.[/green]")
+            _mark_many_read(client, bank=bank, product_id=product, dry_run=dry_run)
+    _finish(dry_run)
+
+
+def _mark_many_read(client: FintonicClient, *, bank: str | None, product_id: str | None, dry_run: bool) -> None:
+    """Bulk endpoints don't say what they touched: list the unread ones first so each can be logged."""
+    product = client.product(product_id) if product_id else None
+    if product:
+        product_read_path(product)  # fail on loans, funds... before listing, also with --dry-run
+    unread = list(client.transactions(bank_id=bank, product=product, unread=True))
+    for tx in unread:
+        _print_change(tx.id, Field.read, False, True, None, dry_run=dry_run)
+    err.print(f"{len(unread)} movimientos sin leer.")
+    if dry_run:
+        return
+    if product:
+        client.mark_product_read(product)
+    else:
+        client.mark_all_read(bank)
+    scope = f"product:{product_id}" if product_id else f"bank:{bank}" if bank else "all"
+    for tx in unread:
+        _record(tx, Field.read, False, True, "mark-read", scope=scope)
+
+
+@tx_app.command("mark-unread")
+def tx_mark_unread(
+    tx_ids: Annotated[list[str], typer.Argument(help="ids a marcar como no leídos.")],
+    dry_run: DryRunOpt = False,
+) -> None:
+    """Marca movimientos como no leídos (la web no lo permite; endpoint de la app Android)."""
+    with _client() as client:
+        for tx_id in tx_ids:
+            tx = client.transaction(tx_id)
+            write = partial(client.mark_unread, tx_id)
+            _change(tx, Field.read, False, write, command="mark-unread", dry_run=dry_run)
+    _finish(dry_run)
+
+
+@tx_app.command("set-date")
+def tx_set_date(
+    tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
+    day: Annotated[str, typer.Argument(help="Fecha nueva YYYY-MM-DD.", metavar="YYYY-MM-DD")],
+    dry_run: DryRunOpt = False,
+) -> None:
+    """[EXPERIMENTAL] Cambia la fecha del movimiento. Sin verificar en una cuenta real: compruébala con `tx show`."""
+    new_day = _parse_day(day)
+    with _client() as client:
+        tx = client.transaction(tx_id)
+        write = partial(client.set_user_date, tx_id, new_day)
+        _change(tx, Field.user_date, new_day.isoformat(), write, command="set-date", dry_run=dry_run)
+    if not dry_run:
+        err.print("[yellow]Experimental: comprueba la fecha con `fintonic tx show`.[/yellow]")
+    _finish(dry_run)
+
+
+@tx_app.command("history")
+def tx_history(
+    tx_id: Annotated[str | None, typer.Argument(help="id del movimiento (vacío = todos).")] = None,
+    limit: Annotated[int, typer.Option("--limit", "-n", min=0, help="Máximo de cambios (0 = todos).")] = 20,
+    fmt: FormatOpt = OutputFormat.table,
+) -> None:
+    """Cambios hechos desde este equipo, del más reciente al más antiguo (no consulta la API)."""
+    records = _changelog().history(tx_id, limit or None)
+    if fmt is OutputFormat.json:
+        print_json([asdict(r) for r in records])
+        return
+    rows = [
+        {
+            "fecha": r.moment.astimezone().strftime("%Y-%m-%d %H:%M"),
+            "comando": f"{r.command} --similar" if r.rule else r.command,
+            "id": r.tx_id,
+            "campo": LABELS.get(r.field, r.field),
+            "antes": describe_value(r.field, r.before),
+            "después": describe_value(r.field, r.after),
+            "ámbito": r.scope or "",
+        }
+        for r in records
+    ]
+    render(rows, fmt, title="Historial de cambios")
+
+
+@tx_app.command("undo")
+def tx_undo(
+    tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
+    dry_run: DryRunOpt = False,
+) -> None:
+    """Deshace el último cambio registrado de un movimiento (también se registra)."""
+    record = _changelog().last_for(tx_id)
+    if record is None:
+        raise no_history(tx_id)
+    with _client() as client:
+        tx = client.transaction(tx_id)
+        cats = client.categories() if record.field == Field.category else None
+        plan = plan_undo(record, tx, cats)
+        if plan.noop:
+            target = escape(describe_value(plan.field, plan.target, cats))
+            err.print(f"Nada que deshacer: su {LABELS[plan.field]} ya es {target}.", soft_wrap=True)
+            return
+        write = partial(write_value, client, tx, plan.field, plan.target)
+        _change(tx, plan.field, plan.target, write, command="undo", dry_run=dry_run, cats=cats, undoes=record.timestamp)
+    _finish(dry_run, f"Deshecho el cambio {escape(record.command)} del {record.moment.astimezone():%Y-%m-%d %H:%M}.")
 
 
 @app.command()
@@ -593,7 +794,7 @@ def main() -> None:
     try:
         app()
     except FintonicError as exc:
-        err.print(f"[red]Error:[/red] {exc}")
+        err.print(f"[red]Error:[/red] {escape(str(exc))}")
         raise SystemExit(1) from exc
     except httpx.HTTPError as exc:
         err.print(f"[red]Error de red:[/red] {type(exc).__name__}. Fintonic no responde; reintenta en un rato.")
