@@ -23,7 +23,10 @@ fintonic products [account|credit_card|loan|...] [--all]   # sin tipo = todos; -
 fintonic categories [--all]
 fintonic transactions --from 2026-10-01 --to 2026-10-31 -c G0898 -s mercadona -n 0 -f csv
 fintonic transactions --product <id> --unread  # id de `fintonic products`
-fintonic summary --month 2026-10 [--group parent] [--exclude-bank 2091] [--exclude-product <id>]
+fintonic summary --month 2026-10 [--group parent] [--exclude-bank 2091] [--exclude-product <id>] [--local]
+fintonic summary --budgets [--budgets-file budgets.toml] [--fail-over-budget]   # presupuestos locales (ver abajo)
+fintonic cashflow --months 12 [--to 2026-10] [--category G0898|G0800]   # ingresos/gastos/neto por mes
+fintonic transfers --month 2026-10 [--from … --to …] [--days 3] [--apply [--yes]]   # traspasos mal categorizados
 fintonic refresh [--no-wait] [--timeout 300]  # sincronizar bancos y esperar (avisa de 2FA pendiente)
 
 # Escritura (modifica tu cuenta)
@@ -49,6 +52,29 @@ fintonic verify 123456
 ```
 
 Todas las órdenes de listado aceptan `-f table|json|csv`.
+
+### Resumen y flujo de caja
+
+- `summary` sin `--exclude-*` usa las estadísticas ya calculadas del BFF (`stats/range/net/categories`, una llamada); con exclusiones, o con `--local`, pagina los movimientos y calcula en local. Ambos caminos dan las mismas filas y totales.
+- `cashflow` usa `stats/period/cashFlow`: una llamada cada 12 meses (el BFF no acepta más periodos por petición). Con `--category` muestra el neto y el nº de movimientos de esa categoría por mes; si es un grupo (p. ej. `G0800`) suma sus subcategorías, porque el BFF devuelve siempre 0 para los grupos.
+
+### Presupuestos locales
+
+Fintonic no expone los presupuestos de la app, así que se definen en un fichero TOML propio: `$XDG_CONFIG_HOME/fintonic/budgets.toml` (por defecto `~/.config/fintonic/budgets.toml`), o el que indiquen `--budgets-file` o `FINTONIC_BUDGETS`.
+
+```toml
+# Límite mensual en euros por categoría o grupo de gasto (ids de `fintonic categories --all`)
+G0800 = 300      # grupo "Gastos varios": cuenta todo lo que cuelga de él
+G0898 = 120.50   # solo "Restaurante"
+```
+
+- Solo ids de gasto (`G` + 4 dígitos), importes positivos con 2 decimales como mucho; cualquier error se indica con el fichero y la clave.
+- `summary --budgets` añade una tabla con presupuesto, gastado, % consumido y si se ha superado (las devoluciones restan). En JSON va en la clave `budgets`; con `-f csv` la salida es la tabla de presupuestos.
+- `--fail-over-budget` (implica `--budgets`) sale con **código 3** si algún presupuesto se ha superado, para la revisión diaria automatizada.
+
+### Traspasos entre tus cuentas
+
+`transfers` busca pares cargo/abono del mismo importe absoluto en dos productos distintos con ±`--days` días (3 por defecto) en los que al menos un lado no está en una categoría no computable `N*`, y propone pasarlos a `N0102` ("Que realices entre tus cuentas"). Cada movimiento entra en un solo par (gana la fecha más cercana) y los traspasos que ya están en `N*` en los dos lados no se proponen ni se reutilizan. No se tienen en cuenta los movimientos divididos. Sin `--apply` solo lista; con `--apply` pide confirmación (`--yes` para omitirla) y recategoriza los lados que no son `N*`.
 
 ## Como librería
 
@@ -102,6 +128,18 @@ Escritura (todas `POST`, nunca se reintentan):
 Otros GET útiles: `/rest/transaction/listByIds?transactionIds=…`, `/rest/stats/getAllByRange?beginDate&endDate` (ingresos/gastos por categoría calculados por Fintonic; `summary` coincide al céntimo), `/rest/category/probability?transactionId=…`.
 
 BFF `https://fintonic-pfm-bff.fintonic.com`: `user-insights`, `score/history`, `insurances`, `openbanking/aggregations/`.
+
+Estadísticas del BFF (`AnalysisBffRetrofit` en la app Android; importes en céntimos con signo, sin categorías `N*` en los totales):
+
+| Ruta | Respuesta |
+|---|---|
+| `/stats/range/cashFlow?startDate&endDate` | `{income, expenses, net}` |
+| `/stats/period/cashFlow?pivotDate&timeUnit&numberOfPeriods&page` | `[{dateRange, cashFlow}]`, del más antiguo al más reciente |
+| `/stats/range/net/categories?startDate&endDate[&categoryRegexFilter]` | `[{categoryId, net, numTransactions}]` por categoría hoja, `N*` incluidas |
+| `/stats/range/net/categories/{categoryId}?startDate&endDate` | `{categoryId, net, numTransactions}` |
+| `/stats/period/net/categories/{categoryId}?pivotDate&timeUnit&numberOfPeriods&page` | `[{dateRange, categoryNet}]` |
+
+`pivotDate` es `YYYY-MM-DD` y el último periodo devuelto es el que lo contiene; `timeUnit` ∈ `WEEK`, `MONTH`, `QUARTER`, `YEAR`; `numberOfPeriods` ≤ 12 (más da 400) y `page` retrocede de `numberOfPeriods` en `numberOfPeriods`. Para un grupo (`G0800`) devuelven 0 o un error RFC 7807 con HTTP 200, y `categoryRegexFilter` no admite alternativas (`|`).
 
 ## Desarrollo
 

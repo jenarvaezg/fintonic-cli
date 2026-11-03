@@ -5,15 +5,17 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 import typer
 from rich.console import Console
 
+from fintonic import budgets as local_budgets
 from fintonic.auth import Authenticator, stored_pin_relogin
+from fintonic.cashflow import monthly_cash_flow, monthly_category_net
 from fintonic.client import PRODUCT_ENDPOINTS, FintonicClient
 from fintonic.errors import DeviceVerificationRequired, FintonicError, InputError, NotLoggedInError
 from fintonic.http import build_http_client
@@ -21,7 +23,8 @@ from fintonic.models import Category, Transaction, cents_to_decimal
 from fintonic.output import OutputFormat, format_eur, print_json, render
 from fintonic.split import parse_part
 from fintonic.stores import SessionStore, StoreKind, resolve_store
-from fintonic.summary import month_range, summarize
+from fintonic.summary import Summary, month_range, summarize, summarize_nets
+from fintonic.transfers import TRANSFER_CATEGORY, TransferPair, find_transfers, tx_date
 
 # Never render locals in tracebacks: frames hold the PIN and tokens.
 app = typer.Typer(no_args_is_help=True, help="CLI no oficial para Fintonic.", pretty_exceptions_show_locals=False)
@@ -378,42 +381,109 @@ def summary(
     exclude_product: Annotated[
         list[str] | None, typer.Option("--exclude-product", help="id de producto a excluir.")
     ] = None,
+    local: Annotated[
+        bool, typer.Option("--local", help="Calcular paginando los movimientos en vez de usar las estadísticas.")
+    ] = False,
+    budgets: Annotated[bool, typer.Option("--budgets", help="Comparar con los presupuestos locales.")] = False,
+    budgets_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--budgets-file",
+            envvar=local_budgets.ENV_VAR,
+            help="Fichero TOML de presupuestos (por defecto $XDG_CONFIG_HOME/fintonic/budgets.toml).",
+        ),
+    ] = None,
+    fail_over_budget: Annotated[
+        bool, typer.Option("--fail-over-budget", help="Salir con código 3 si algún presupuesto se ha superado.")
+    ] = False,
 ) -> None:
-    """Ingresos y gastos del mes por categoría (sin no computables: traspasos, inversiones...)."""
+    """Ingresos y gastos del mes por categoría (sin no computables: traspasos, inversiones...).
+
+    Sin --exclude-* usa las estadísticas ya calculadas por Fintonic (una sola llamada).
+    """
     if group not in {"category", "parent"}:
         raise typer.BadParameter("--group debe ser 'category' o 'parent'.")
     begin, end = month_range(month or date.today().strftime("%Y-%m"))
+    use_budgets = budgets or fail_over_budget
+    limits = local_budgets.load_budgets(budgets_file or local_budgets.default_path()) if use_budgets else {}
     with _client() as client:
         cats = client.categories()
-        excluded_keys = frozenset(k for pid in exclude_product or [] for k in client.product(pid).transaction_keys)
-        excluded_banks = frozenset(exclude_bank or [])
-        txs = [
-            t
-            for t in client.transactions(begin=begin, end=end)
-            if t.bank_id not in excluded_banks and t.product_id not in excluded_keys
-        ]
-    result = summarize(txs, cats, group_by_parent=group == "parent")
+        if limits:
+            local_budgets.check_known(limits, cats)
+        if local or exclude_bank or exclude_product:
+            excluded_keys = frozenset(k for pid in exclude_product or [] for k in client.product(pid).transaction_keys)
+            excluded_banks = frozenset(exclude_bank or [])
+            txs = [
+                t
+                for t in client.transactions(begin=begin, end=end)
+                if t.bank_id not in excluded_banks and t.product_id not in excluded_keys
+            ]
+            leaf = summarize(txs, cats)
+            result = summarize(txs, cats, group_by_parent=True) if group == "parent" else leaf
+        else:
+            nets = client.category_nets(begin, end)
+            leaf = summarize_nets(nets, cats)
+            result = summarize_nets(nets, cats, group_by_parent=True) if group == "parent" else leaf
+    statuses = local_budgets.evaluate(limits, leaf.rows, cats) if limits else []
+    _print_summary(result, statuses, begin, fmt, with_budgets=use_budgets)
+    if fail_over_budget and any(s.over for s in statuses):
+        raise typer.Exit(3)
 
+
+def _budget_rows(statuses: list[local_budgets.BudgetStatus], fmt: OutputFormat) -> list[dict[str, Any]]:
+    table = fmt is OutputFormat.table
+    money = format_eur if table else cents_to_decimal
+    return [
+        {
+            "id": s.category_id,
+            "categoría": s.name,
+            "presupuesto": money(s.limit),
+            "gastado": money(s.spent),
+            "%": f"{s.percent} %" if table else s.percent,
+            "excedido": ("SÍ" if s.over else "") if table else s.over,
+        }
+        for s in statuses
+    ]
+
+
+def _print_summary(
+    result: Summary, statuses: list[local_budgets.BudgetStatus], begin: date, fmt: OutputFormat, *, with_budgets: bool
+) -> None:
     if fmt is OutputFormat.json:
-        print_json(
-            {
-                "month": begin.strftime("%Y-%m"),
-                "income": cents_to_decimal(result.income),
-                "expenses": cents_to_decimal(result.expenses),
-                "net": cents_to_decimal(result.net),
-                "excluded_non_computable": cents_to_decimal(result.excluded_non_computable),
-                "categories": [
-                    {
-                        "id": r.category_id,
-                        "name": r.name,
-                        "kind": r.kind,
-                        "amount": cents_to_decimal(r.amount),
-                        "count": r.count,
-                    }
-                    for r in result.rows
-                ],
-            }
-        )
+        body: dict[str, Any] = {
+            "month": begin.strftime("%Y-%m"),
+            "income": cents_to_decimal(result.income),
+            "expenses": cents_to_decimal(result.expenses),
+            "net": cents_to_decimal(result.net),
+            "excluded_non_computable": cents_to_decimal(result.excluded_non_computable),
+            "categories": [
+                {
+                    "id": r.category_id,
+                    "name": r.name,
+                    "kind": r.kind,
+                    "amount": cents_to_decimal(r.amount),
+                    "count": r.count,
+                }
+                for r in result.rows
+            ],
+        }
+        if with_budgets:
+            body["budgets"] = [
+                {
+                    "id": s.category_id,
+                    "name": s.name,
+                    "limit": cents_to_decimal(s.limit),
+                    "spent": cents_to_decimal(s.spent),
+                    "percent": s.percent,
+                    "over": s.over,
+                }
+                for s in statuses
+            ]
+        print_json(body)
+        return
+
+    if fmt is OutputFormat.csv and with_budgets:  # one table per CSV: budgets were asked for
+        render(_budget_rows(statuses, fmt), fmt)
         return
 
     table = fmt is OutputFormat.table
@@ -423,12 +493,170 @@ def summary(
         for r in result.rows
     ]
     render(rows, fmt, title=f"Resumen {begin:%Y-%m}")
-    if table:
+    if not table:
+        return
+    err.print(
+        f"Ingresos {format_eur(result.income)} · Gastos {format_eur(result.expenses)} · "
+        f"[bold]Neto {format_eur(result.net)}[/bold]  (no computable excluido: "
+        f"{format_eur(result.excluded_non_computable)})"
+    )
+    if with_budgets:
+        render(_budget_rows(statuses, fmt), fmt, title=f"Presupuestos {begin:%Y-%m}")
+        over = [s.category_id for s in statuses if s.over]
+        if over:
+            err.print(f"[red]Presupuesto superado en: {', '.join(over)}[/red]")
+
+
+@app.command()
+def cashflow(
+    fmt: FormatOpt = OutputFormat.table,
+    months: Annotated[int, typer.Option("--months", "-n", min=1, help="Número de meses.")] = 12,
+    until: Annotated[
+        str | None, typer.Option("--to", help="Último mes YYYY-MM incluido (por defecto, el actual).")
+    ] = None,
+    category: Annotated[
+        str | None, typer.Option("--category", "-c", help="Solo esta categoría o grupo (p.ej. G0898, G0800).")
+    ] = None,
+) -> None:
+    """Ingresos, gastos y neto por mes (estadísticas de Fintonic, sin no computables)."""
+    pivot = month_range(until or date.today().strftime("%Y-%m"))[0]
+    table = fmt is OutputFormat.table
+    money = format_eur if table else cents_to_decimal
+    with _client() as client:
+        if category:
+            category_id = category.upper()
+            cats = client.categories()
+            series = monthly_category_net(client, category_id, cats, pivot, months)
+            name = cats[category_id].name
+            rows = [{"mes": f"{m.start:%Y-%m}", "movs": m.count, "importe": money(m.net)} for m in series]
+            render(rows, fmt, title=f"{name} ({category_id}) por mes")
+            return
+        flows = monthly_cash_flow(client, pivot, months)
+    rows = [
+        {"mes": f"{f.start:%Y-%m}", "ingresos": money(f.income), "gastos": money(f.expenses), "neto": money(f.net)}
+        for f in flows
+    ]
+    render(rows, fmt, title="Flujo de caja")
+    if table and flows:
         err.print(
-            f"Ingresos {format_eur(result.income)} · Gastos {format_eur(result.expenses)} · "
-            f"[bold]Neto {format_eur(result.net)}[/bold]  (no computable excluido: "
-            f"{format_eur(result.excluded_non_computable)})"
+            f"Total: ingresos {format_eur(sum(f.income for f in flows))} · "
+            f"gastos {format_eur(sum(f.expenses for f in flows))} · "
+            f"[bold]neto {format_eur(sum(f.net for f in flows))}[/bold]"
         )
+
+
+def _period(month: str | None, since: str | None, until: str | None) -> tuple[date, date]:
+    if month and (since or until):
+        raise typer.BadParameter("Usa --month o --from/--to, no ambos.")
+    if since or until:
+        begin, end = _parse_date(since), _parse_date(until)
+        today = date.today()
+        begin = begin or (end or today).replace(day=1)
+        end = end or today
+        if begin > end:
+            raise typer.BadParameter("--from es posterior a --to.")
+        return begin, end
+    return month_range(month or date.today().strftime("%Y-%m"))
+
+
+def _cat_label(t: Transaction, cats: dict[str, Category]) -> str:
+    cid = t.category_id or ""
+    return f"{cats[cid].name} ({cid})" if cid in cats else cid
+
+
+@app.command()
+def transfers(
+    fmt: FormatOpt = OutputFormat.table,
+    month: Annotated[str | None, typer.Option("--month", "-m", help="Mes YYYY-MM (por defecto, el actual).")] = None,
+    since: Annotated[str | None, typer.Option("--from", help="Fecha inicio YYYY-MM-DD.")] = None,
+    until: Annotated[str | None, typer.Option("--to", help="Fecha fin YYYY-MM-DD.")] = None,
+    days: Annotated[int, typer.Option("--days", min=0, help="Máximo de días entre cargo y abono.")] = 3,
+    apply: Annotated[
+        bool, typer.Option("--apply", help=f"Recategorizar como {TRANSFER_CATEGORY} (escribe en tu cuenta).")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="No pedir confirmación con --apply.")] = False,
+) -> None:
+    """Detecta traspasos entre tus productos que no están en una categoría no computable (N*).
+
+    Empareja un cargo y un abono del mismo importe en productos distintos con ±--days días.
+    Sin --apply solo los lista.
+    """
+    begin, end = _period(month, since, until)
+    margin = timedelta(days=days)
+    with _client() as client:
+        cats = client.categories()
+        txs = list(client.transactions(begin=begin - margin, end=end + margin))
+        pairs = [
+            p
+            for p in find_transfers(txs, days=days)
+            if begin <= tx_date(p.debit) <= end or begin <= tx_date(p.credit) <= end
+        ]
+        products = _product_names(client, [t for p in pairs for t in (p.debit, p.credit)])
+        _render_transfers(pairs, cats, products, fmt)
+        targets = [t for p in pairs for t in p.to_recategorize]
+        if not apply or not targets:
+            return
+        if TRANSFER_CATEGORY not in cats:
+            raise InputError(f"La categoría {TRANSFER_CATEGORY} no existe en tu árbol de categorías.")
+        if not yes and not typer.confirm(
+            f"¿Recategorizar {len(targets)} movimientos como {TRANSFER_CATEGORY} ({cats[TRANSFER_CATEGORY].name})?"
+        ):
+            err.print("Cancelado.")
+            raise typer.Exit(1)
+        for t in targets:
+            client.set_category(t.id, TRANSFER_CATEGORY)
+    err.print(f"[green]{len(targets)} movimientos → {TRANSFER_CATEGORY}[/green]")
+
+
+def _render_transfers(
+    pairs: list[TransferPair], cats: dict[str, Category], products: dict[str, str], fmt: OutputFormat
+) -> None:
+    if fmt is OutputFormat.json:
+        print_json(
+            [
+                {
+                    "amount": cents_to_decimal(p.amount),
+                    "days_apart": p.days_apart,
+                    "to_recategorize": [t.id for t in p.to_recategorize],
+                    **{
+                        side: {
+                            "id": t.id,
+                            "date": tx_date(t),
+                            "concept": t.label,
+                            "category_id": t.category_id,
+                            "product_id": t.product_id,
+                            "product": products.get(t.product_id),
+                        }
+                        for side, t in (("debit", p.debit), ("credit", p.credit))
+                    },
+                }
+                for p in pairs
+            ]
+        )
+        return
+    table = fmt is OutputFormat.table
+    fix = {t.id for p in pairs for t in p.to_recategorize}
+
+    def side(t: Transaction) -> str:
+        return f"{_cat_label(t, cats)}{' → ' + TRANSFER_CATEGORY if t.id in fix else ''}"
+
+    rows = [
+        {
+            "importe": format_eur(p.amount) if table else cents_to_decimal(p.amount),
+            "fecha cargo": tx_date(p.debit),
+            "origen": products.get(p.debit.product_id) or p.debit.bank_id,
+            "concepto cargo": p.debit.label,
+            "categoría cargo": side(p.debit),
+            "fecha abono": tx_date(p.credit),
+            "destino": products.get(p.credit.product_id) or p.credit.bank_id,
+            "concepto abono": p.credit.label,
+            "categoría abono": side(p.credit),
+            "id cargo": p.debit.id,
+            "id abono": p.credit.id,
+        }
+        for p in pairs
+    ]
+    render(rows, fmt, title=f"Posibles traspasos ({len(rows)})")
 
 
 @app.command()

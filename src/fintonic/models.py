@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -190,3 +191,44 @@ class Product(_ApiModel):
 class TransactionDateRange(_ApiModel):
     older_transaction_user_date: date | None = None
     newer_transaction_user_date: date | None = None
+
+
+# ---- BFF statistics (`AnalysisBffRetrofit` in the Android app) -------------
+
+
+class TimeUnit(StrEnum):
+    """Values the app sends as `timeUnit` (`AnalysisTimeUnit` subclasses)."""
+
+    WEEK = "WEEK"
+    MONTH = "MONTH"
+    QUARTER = "QUARTER"
+    YEAR = "YEAR"
+
+
+class DateRange(_ApiModel):
+    start_date: date
+    end_date: date
+
+
+class CashFlow(_ApiModel):
+    """Computable income (positive) and expenses (negative) in cents; N* categories are left out."""
+
+    income: int = 0
+    expenses: int = 0
+    net: int = 0
+
+
+class CashFlowPeriod(_ApiModel):
+    date_range: DateRange
+    cash_flow: CashFlow
+
+
+class CategoryNet(_ApiModel):
+    category_id: str
+    net: int = 0  # signed cents
+    num_transactions: int = 0
+
+
+class CategoryNetPeriod(_ApiModel):
+    date_range: DateRange
+    category_net: CategoryNet
