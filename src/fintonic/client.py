@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import date
 from typing import Any, Self
 
@@ -113,8 +113,15 @@ class FintonicClient:
             raise ValueError(f"Tipo de producto desconocido: {kind}. Opciones: {', '.join(PRODUCT_ENDPOINTS)}") from exc
         return [Product.model_validate({**raw, "kind": kind}) for raw in _flatten_by_bank(self.get(endpoint))]
 
-    def all_products(self) -> list[Product]:
-        return [p for kind in PRODUCT_ENDPOINTS for p in self.products(kind)]
+    def all_products(self, kinds: Iterable[str] = PRODUCT_ENDPOINTS) -> list[Product]:
+        return [p for kind in kinds for p in self.products(kind)]
+
+    def product(self, product_id: str) -> Product:
+        """Look up any product (live or canceled) by the `id` shown in `fintonic products`."""
+        for p in self.all_products():
+            if p.id == product_id:
+                return p
+        raise ValueError(f"No existe el producto {product_id}. Mira los ids con `fintonic products --all`.")
 
     def position(self) -> Position:
         return Position.model_validate(self.get("rest/overview/position")["data"])
@@ -138,10 +145,17 @@ class FintonicClient:
         category_id: str | None = None,
         query: str | None = None,
         bank_id: str | None = None,
+        product: Product | None = None,
+        unread: bool = False,
         limit: int | None = None,
         page_size: int = DEFAULT_PAGE_SIZE,
     ) -> Iterator[Transaction]:
-        """Iterate transactions newest-first, paginating transparently."""
+        """Iterate transactions newest-first, paginating transparently.
+
+        `product` has no server-side filter that works with the ids the API exposes, so we
+        narrow by its bank and match `product_id` client-side.
+        """
+        bank_id = product.bank_id if product else bank_id
         path = f"rest/transaction/listByBank/{bank_id}" if bank_id else "rest/transaction/list"
         filters = _compact(
             {
@@ -149,18 +163,25 @@ class FintonicClient:
                 "endDate": end.isoformat() if end else None,
                 "categoryId": category_id,
                 "queryText": query,
+                "read": "false" if unread else None,
             }
         )
-        offset = 0
+        keys = product.transaction_keys if product else None
         yielded = 0
+        for tx in self._paginate(path, filters, page_size):
+            if keys is not None and tx.product_id not in keys:
+                continue
+            yield tx
+            yielded += 1
+            if limit is not None and yielded >= limit:
+                return
+
+    def _paginate(self, path: str, filters: Mapping[str, Any], page_size: int) -> Iterator[Transaction]:
+        offset = 0
         while True:
             body = self.get(path, {**filters, "pageLimit": page_size, "pageOffset": offset})
             items = body.get("resultList") or []
-            for raw in items:
-                yield Transaction.model_validate(raw)
-                yielded += 1
-                if limit is not None and yielded >= limit:
-                    return
+            yield from (Transaction.model_validate(raw) for raw in items)
             offset += len(items)
             if not items or offset >= int(body.get("count") or 0):
                 return

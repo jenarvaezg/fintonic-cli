@@ -16,8 +16,10 @@ from fintonic.auth import Authenticator, stored_pin_relogin
 from fintonic.client import PRODUCT_ENDPOINTS, FintonicClient
 from fintonic.errors import DeviceVerificationRequired, FintonicError, NotLoggedInError
 from fintonic.http import build_http_client
+from fintonic.models import Category, Transaction, cents_to_decimal
 from fintonic.output import OutputFormat, format_eur, print_json, render
 from fintonic.stores import SessionStore, StoreKind, resolve_store
+from fintonic.summary import month_range, summarize
 
 app = typer.Typer(no_args_is_help=True, help="CLI no oficial para Fintonic.")
 err = Console(stderr=True)
@@ -239,6 +241,7 @@ def products(
     table = fmt is OutputFormat.table
     rows = [
         {
+            "id": p.id,
             "tipo": p.kind,
             "banco": p.bank_id,
             "nombre": p.name,
@@ -264,6 +267,19 @@ def categories(fmt: FormatOpt = OutputFormat.table, all_: Annotated[bool, typer.
     render(rows, fmt, title="Categorías")
 
 
+def _product_names(client: FintonicClient, txs: list[Transaction]) -> dict[str, str]:
+    """Map transaction product_id -> product name, fetching only the product kinds present."""
+    kinds = {"ACCOUNT": "account", "CREDITCARD": "credit_card"}
+    needed = {kinds[t.type] for t in txs if t.type in kinds}
+    return {key: p.name for p in client.all_products(sorted(needed)) for key in p.transaction_keys}
+
+
+def _category_label(t: Transaction, cats: dict[str, Category]) -> str:
+    cid = t.category_id
+    name = cats[cid].name if cid in cats else (cid or "")
+    return f"{name} +{len(t.category_amounts) - 1}" if t.is_split else name
+
+
 @app.command()
 def transactions(
     fmt: FormatOpt = OutputFormat.table,
@@ -272,9 +288,11 @@ def transactions(
     category: Annotated[str | None, typer.Option("--category", "-c", help="Id de categoría (p.ej. G0898).")] = None,
     search: Annotated[str | None, typer.Option("--search", "-s", help="Texto a buscar.")] = None,
     bank: Annotated[str | None, typer.Option("--bank", help="bank_id (ver `fintonic banks`).")] = None,
-    limit: Annotated[int | None, typer.Option("--limit", "-n", help="Máximo de movimientos.")] = 50,
+    product: Annotated[str | None, typer.Option("--product", help="id de producto (ver `fintonic products`).")] = None,
+    unread: Annotated[bool, typer.Option("--unread", help="Solo movimientos sin leer.")] = False,
+    limit: Annotated[int | None, typer.Option("--limit", "-n", help="Máximo de movimientos (0 = todos).")] = 50,
 ) -> None:
-    """Movimientos, del más reciente al más antiguo. Usa --limit 0 para todos."""
+    """Movimientos, del más reciente al más antiguo."""
     with _client() as client:
         cats = client.categories()
         txs = list(
@@ -284,22 +302,116 @@ def transactions(
                 category_id=category,
                 query=search,
                 bank_id=bank,
+                product=client.product(product) if product else None,
+                unread=unread,
                 limit=limit or None,
             )
         )
+        products = _product_names(client, txs)
+
+    if fmt is OutputFormat.json:
+        print_json(
+            [
+                {
+                    "id": t.id,
+                    "user_date": t.user_date,
+                    "value_date": t.value_date,
+                    "operation_date": t.operation_date,
+                    "concept": t.label,
+                    "amount": t.amount,
+                    "currency": t.currency,
+                    "category_id": t.category_id,
+                    "category": cats[t.category_id].name if t.category_id in cats else None,
+                    "categories": {cid: str(cents_to_decimal(c)) for cid, c in t.category_amounts.items()},
+                    "split": t.is_split,
+                    "read": t.read,
+                    "bank_id": t.bank_id,
+                    "product_id": t.product_id,
+                    "product": products.get(t.product_id),
+                }
+                for t in txs
+            ]
+        )
+        return
+
     table = fmt is OutputFormat.table
     rows = [
         {
             "fecha": t.user_date or t.value_date,
+            "f.operación": t.operation_date,
             "concepto": t.label,
-            "categoría": cats[t.category_id].name if t.category_id in cats else t.category_id,
+            "categoría": _category_label(t, cats),
             "importe": format_eur(t.quantity) if table else t.amount,
-            "banco": t.bank_id,
-            **({} if table else {"id": t.id, "category_id": t.category_id, "currency": t.currency}),
+            "producto": products.get(t.product_id) or t.bank_id,
+            "leído": ("" if t.read else "●") if table else t.read,
+            "id": t.id,
         }
         for t in txs
     ]
     render(rows, fmt, title=f"Movimientos ({len(rows)})")
+
+
+@app.command()
+def summary(
+    fmt: FormatOpt = OutputFormat.table,
+    month: Annotated[str | None, typer.Option("--month", "-m", help="Mes YYYY-MM (por defecto, el actual).")] = None,
+    group: Annotated[
+        str, typer.Option("--group", help="category (hoja) o parent (grupo, p.ej. 'Gastos varios').")
+    ] = "category",
+    exclude_bank: Annotated[list[str] | None, typer.Option("--exclude-bank", help="bank_id a excluir.")] = None,
+    exclude_product: Annotated[
+        list[str] | None, typer.Option("--exclude-product", help="id de producto a excluir.")
+    ] = None,
+) -> None:
+    """Ingresos y gastos del mes por categoría (sin no computables: traspasos, inversiones...)."""
+    if group not in {"category", "parent"}:
+        raise typer.BadParameter("--group debe ser 'category' o 'parent'.")
+    begin, end = month_range(month or date.today().strftime("%Y-%m"))
+    with _client() as client:
+        cats = client.categories()
+        excluded_keys = frozenset(k for pid in exclude_product or [] for k in client.product(pid).transaction_keys)
+        txs = [
+            t
+            for t in client.transactions(begin=begin, end=end)
+            if t.bank_id not in set(exclude_bank or []) and t.product_id not in excluded_keys
+        ]
+    result = summarize(txs, cats, group_by_parent=group == "parent")
+
+    if fmt is OutputFormat.json:
+        print_json(
+            {
+                "month": begin.strftime("%Y-%m"),
+                "income": cents_to_decimal(result.income),
+                "expenses": cents_to_decimal(result.expenses),
+                "net": cents_to_decimal(result.net),
+                "excluded_non_computable": cents_to_decimal(result.excluded_non_computable),
+                "categories": [
+                    {
+                        "id": r.category_id,
+                        "name": r.name,
+                        "kind": r.kind,
+                        "amount": cents_to_decimal(r.amount),
+                        "count": r.count,
+                    }
+                    for r in result.rows
+                ],
+            }
+        )
+        return
+
+    table = fmt is OutputFormat.table
+    money = format_eur if table else cents_to_decimal
+    rows = [
+        {"tipo": r.kind, "id": r.category_id, "categoría": r.name, "movs": r.count, "importe": money(r.amount)}
+        for r in result.rows
+    ]
+    render(rows, fmt, title=f"Resumen {begin:%Y-%m}")
+    if table:
+        err.print(
+            f"Ingresos {format_eur(result.income)} · Gastos {format_eur(result.expenses)} · "
+            f"[bold]Neto {format_eur(result.net)}[/bold]  (no computable excluido: "
+            f"{format_eur(result.excluded_non_computable)})"
+        )
 
 
 @app.command()

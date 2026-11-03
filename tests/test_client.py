@@ -8,7 +8,7 @@ import respx
 
 from fintonic.client import FintonicClient
 from fintonic.errors import ApiError, DeviceVerificationRequired, NotLoggedInError, SessionExpiredError
-from fintonic.models import Transaction
+from fintonic.models import Product, Transaction
 from fintonic.session import Session
 from fintonic.stores import MemorySessionStore
 from tests.conftest import API, BFF, make_jwt, make_tx
@@ -76,6 +76,57 @@ def test_transactions_by_bank(mock_api: respx.MockRouter, http: httpx.Client, se
     route = mock_api.get(f"{API}/rest/transaction/listByBank/0182").mock(return_value=_page([], 0))
     list(FintonicClient(session, http=http).transactions(bank_id="0182"))
     assert route.called
+
+
+def test_split_category_is_largest_absolute_share() -> None:
+    tx = Transaction.model_validate(
+        make_tx(
+            0, quantity=-1000, categorization={"weightedCategories": {"G0101": -100, "G0898": -900}, "splited": True}
+        )
+    )
+    assert tx.category_id == "G0898"
+    assert tx.is_split
+    assert tx.category_amounts == {"G0101": -100, "G0898": -900}
+
+
+def test_product_filter_is_client_side_within_bank(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session
+) -> None:
+    mine = make_tx(1, productId="ccc-mine")
+    other = make_tx(2, productId="ccc-other")
+    route = mock_api.get(f"{API}/rest/transaction/listByBank/0182").mock(
+        return_value=_page([other, mine, other, mine], 4)
+    )
+    product = Product(kind="account", id="a1", bankId="0182", ccc="ccc-mine")
+
+    result = list(FintonicClient(session, http=http).transactions(product=product, limit=1))
+
+    assert [t.id for t in result] == ["tx0001"]
+    assert route.called
+
+
+def test_unread_filter(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    route = mock_api.get(TX_LIST).mock(return_value=_page([], 0))
+    list(FintonicClient(session, http=http).transactions(unread=True))
+    assert route.calls.last.request.url.params["read"] == "false"
+
+
+def test_product_lookup(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    for path, key in [
+        ("account/listAccounts", "accounts"),
+        ("creditcard/listCreditCards", "creditCards"),
+        ("deposit/listDeposits", "deposits"),
+        ("fund/listFunds", "funds"),
+        ("loan/listLoans", "loans"),
+        ("share/listShares", "shares"),
+        ("pensionplan/listPensionPlans", "pensionPlans"),
+    ]:
+        products = [{"id": "c9", "bankId": "0182", "cardNumber": "1234"}] if key == "creditCards" else []
+        mock_api.get(f"{API}/rest/{path}").mock(return_value=httpx.Response(200, json={key: {"0182": products}}))
+    client = FintonicClient(session, http=http)
+    assert client.product("c9").transaction_keys == {"1234"}
+    with pytest.raises(ValueError, match="No existe"):
+        client.product("nope")
 
 
 def test_transaction_model() -> None:

@@ -22,9 +22,20 @@ fintonic banks                                 # bancos conectados y estado de s
 fintonic products [account|credit_card|loan|...] [--all]   # sin tipo = todos; --all incluye cancelados
 fintonic categories [--all]
 fintonic transactions --from 2026-10-01 --to 2026-10-31 -c G0898 -s mercadona -n 0 -f csv
+fintonic transactions --product <id> --unread  # id de `fintonic products`
+fintonic summary --month 2026-10 [--group parent] [--exclude-bank 2091] [--exclude-product <id>]
 fintonic raw rest/user/profile                 # GET arbitrario (exploración)
 fintonic raw user-insights --bff
 fintonic logout [--forget-device]
+```
+
+### Sin escritorio (Linux, CI, cron)
+
+```bash
+export FINTONIC_STORE=file                     # ~/.config/fintonic/session.json (0600); "auto" lo elige si no hay keyring
+echo "$PIN" | fintonic login --email tu@email.com --pin-stdin --remember   # o FINTONIC_PIN
+# primera vez en este dispositivo: el SMS se envía y el comando termina
+fintonic verify 123456
 ```
 
 Todas las órdenes de listado aceptan `-f table|json|csv`.
@@ -43,7 +54,9 @@ with FintonicClient(store.load(), store=store) as client:
 ## Diseño
 
 - **Reintentos por defecto**: `GET/HEAD/OPTIONS` se reintentan 4 veces con backoff exponencial + jitter ante `429/500/502/503/504`, timeouts y errores de red (respeta `Retry-After`). El login (`POST`) y el SMS (`PUT`) **nunca** se reintentan, para no gastar intentos de PIN ni cupo de SMS.
-- **Sesión en el Keychain** (`keyring`), nunca en ficheros. El access token dura 30 min; con `--remember` se renueva solo re-logueando con el PIN guardado.
+- **Sesión en el Keychain** (`keyring`) o en un fichero 0600 si no hay keyring. El access token dura 30 min y **no hay endpoint de refresh** (el `refresh_token` que devuelve el login no se puede canjear: finapi no expone ruta y el Keycloak no es público), así que con `--remember` se renueva re-logueando con el PIN guardado. Si ese re-login falla por credenciales, el PIN se borra al instante para no bloquear la cuenta.
+- **Movimientos divididos**: `weightedCategories` son céntimos con signo por categoría que suman el total; `summary` reparte cada parte en su categoría. Las categorías `N*` (no computables: traspasos, inversiones, liquidación de tarjeta) se excluyen.
+- **Producto de un movimiento**: `product_id` es el `ccc` de la cuenta o el número de tarjeta; `--product` filtra en cliente dentro del banco.
 - **Dispositivo persistente**: se reenvía el `deviceUUID` verificado en cada login, así que el SMS solo se pide la primera vez.
 - Importes en **céntimos** (`quantity`); los modelos exponen `amount` como `Decimal` en euros.
 

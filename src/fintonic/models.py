@@ -54,9 +54,19 @@ class Transaction(_ApiModel):
         return cents_to_decimal(self.quantity)
 
     @property
+    def category_amounts(self) -> dict[str, int]:
+        """Signed cents per category; they add up to `quantity` (more than one entry when split)."""
+        return dict(self.categorization.weighted_categories) if self.categorization else {}
+
+    @property
+    def is_split(self) -> bool:
+        return bool(self.categorization and self.categorization.splited) or len(self.category_amounts) > 1
+
+    @property
     def category_id(self) -> str | None:
-        weights = self.categorization.weighted_categories if self.categorization else {}
-        return max(weights, key=weights.__getitem__) if weights else None
+        """Category carrying the largest share of the amount."""
+        amounts = self.category_amounts
+        return max(amounts, key=lambda cid: abs(amounts[cid])) if amounts else None
 
     @property
     def label(self) -> str:
@@ -74,6 +84,16 @@ class Category(_ApiModel):
     ancestors: list[str] = Field(default_factory=list)
     classified: bool = False
     computable: bool = True
+
+    @property
+    def parent_id(self) -> str:
+        """Second-level group, e.g. G0898 (Restaurante) -> G0800 (Gastos varios)."""
+        return self.ancestors[2] if len(self.ancestors) > 2 else self.id
+
+    @property
+    def kind(self) -> str:
+        """G = gasto, I = ingreso, N = no computable."""
+        return self.id[:1]
 
 
 class Balances(_ApiModel):
@@ -142,7 +162,16 @@ class Product(_ApiModel):
     web_alias: str | None = None
     display_ccc: str | None = None
     display_card_number: str | None = None
+    ccc: str | None = None
+    card_number: str | None = None
+    account_number: str | None = None
     last_update: int | None = None
+
+    @property
+    def transaction_keys(self) -> frozenset[str]:
+        """Values a transaction's `product_id` takes for this product (ccc for accounts, card number for cards)."""
+        candidates = (self.ccc, self.card_number, self.display_card_number, self.account_number)
+        return frozenset(c for c in candidates if c)
 
     @property
     def name(self) -> str:

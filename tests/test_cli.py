@@ -30,21 +30,75 @@ def test_format_eur() -> None:
     assert format_eur(0) == "0,00 €"
 
 
+ACCOUNTS = {"accounts": {"0182": [{"id": "acc1", "bankId": "0182", "alias": "Nómina", "ccc": "p" * 64}]}}
+
+
 def test_transactions_json(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
     mock_api.get(f"{API}/rest/category/tree").mock(return_value=httpx.Response(200, json=CATS))
+    mock_api.get(f"{API}/rest/account/listAccounts").mock(return_value=httpx.Response(200, json=ACCOUNTS))
+    split = make_tx(
+        2, quantity=-1000, categorization={"weightedCategories": {"G0898": -700, "G0101": -300}, "splited": True}
+    )
     mock_api.get(f"{API}/rest/transaction/list").mock(
-        return_value=httpx.Response(200, json={"count": 1, "resultList": [make_tx(1, quantity=-1050)]})
+        return_value=httpx.Response(200, json={"count": 2, "resultList": [make_tx(1, quantity=-1050), split]})
     )
     result = runner.invoke(cli.app, ["transactions", "-f", "json"])
     assert result.exit_code == 0, result.output
-    row = json.loads(result.stdout)[0]
-    assert row["importe"] == "-10.50"
-    assert row["categoría"] == "Restaurante"
-    assert row["category_id"] == "G0898"
+    first, second = json.loads(result.stdout)
+    assert first["amount"] == "-10.50"
+    assert first["category"] == "Restaurante"
+    assert first["product"] == "Nómina"
+    assert first["operation_date"] == "2026-10-29"
+    assert second["split"] is True
+    assert second["categories"] == {"G0898": "-7.00", "G0101": "-3.00"}
+
+
+def test_transactions_table_marks_splits(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
+    mock_api.get(f"{API}/rest/category/tree").mock(return_value=httpx.Response(200, json=CATS))
+    mock_api.get(f"{API}/rest/account/listAccounts").mock(return_value=httpx.Response(200, json=ACCOUNTS))
+    split = make_tx(2, quantity=-1000, categorization={"weightedCategories": {"G0898": -700, "G0101": -300}})
+    mock_api.get(f"{API}/rest/transaction/list").mock(
+        return_value=httpx.Response(200, json={"count": 1, "resultList": [split]})
+    )
+    result = runner.invoke(cli.app, ["transactions", "-f", "csv"])
+    row = next(csv.DictReader(io.StringIO(result.stdout)))
+    assert row["categoría"] == "Restaurante +1"
+    assert row["producto"] == "Nómina"
+    assert row["id"] == "tx0002"
+
+
+def test_summary_json(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
+    tree = {
+        "categoryTree": {
+            "G0898": {"id": "G0898", "name": "Restaurante", "ancestors": ["root", "G0000", "G0800"]},
+            "I0101": {"id": "I0101", "name": "Nómina", "ancestors": ["root", "I0000", "I0100"]},
+            "N0102": {"id": "N0102", "name": "Traspaso", "computable": False, "ancestors": ["root", "N0000", "N0100"]},
+        }
+    }
+    txs = [
+        make_tx(1, quantity=200000, bankId="0182", categorization={"weightedCategories": {"I0101": 200000}}),
+        make_tx(2, quantity=-3000, bankId="0182", categorization={"weightedCategories": {"G0898": -3000}}),
+        make_tx(3, quantity=-50000, bankId="0182", categorization={"weightedCategories": {"N0102": -50000}}),
+        make_tx(4, quantity=-999, bankId="2091", categorization={"weightedCategories": {"G0898": -999}}),
+    ]
+    mock_api.get(f"{API}/rest/category/tree").mock(return_value=httpx.Response(200, json=tree))
+    route = mock_api.get(f"{API}/rest/transaction/list").mock(
+        return_value=httpx.Response(200, json={"count": 4, "resultList": txs})
+    )
+
+    result = runner.invoke(cli.app, ["summary", "--month", "2026-10", "--exclude-bank", "2091", "-f", "json"])
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert (body["income"], body["expenses"], body["net"]) == ("2000.00", "-30.00", "1970.00")
+    assert body["excluded_non_computable"] == "-500.00"
+    params = route.calls.last.request.url.params
+    assert (params["beginDate"], params["endDate"]) == ("2026-10-01", "2026-10-31")
 
 
 def test_transactions_csv(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
     mock_api.get(f"{API}/rest/category/tree").mock(return_value=httpx.Response(200, json=CATS))
+    mock_api.get(f"{API}/rest/account/listAccounts").mock(return_value=httpx.Response(200, json=ACCOUNTS))
     mock_api.get(f"{API}/rest/transaction/list").mock(
         return_value=httpx.Response(200, json={"count": 2, "resultList": [make_tx(1), make_tx(2)]})
     )
