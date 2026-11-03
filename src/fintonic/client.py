@@ -3,19 +3,38 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from datetime import date
 from itertools import islice
 from typing import Any, Self
 
 import httpx
 
-from fintonic.aggregation import AggregationStatus, evaluate
+from fintonic.aggregation import (
+    AggregationStatus,
+    SecondFactorRequest,
+    entity_id,
+    evaluate,
+    find_aggregation,
+    is_invalid_2fa,
+    needs_2fa,
+    second_factor_body,
+)
 from fintonic.config import API_BASE, BFF_BASE
 from fintonic.errors import InputError, NotLoggedInError, SessionExpiredError, raise_for_response
 from fintonic.headers import auth_headers
 from fintonic.http import build_http_client
-from fintonic.models import BankRegistry, Category, Position, Product, Transaction, TransactionDateRange
+from fintonic.models import (
+    BankRegistry,
+    Category,
+    CategorySuggestion,
+    Mandate,
+    Position,
+    Product,
+    Transaction,
+    TransactionDateRange,
+)
 from fintonic.session import Session
 from fintonic.split import build_split_body
 from fintonic.stores import SessionStore
@@ -32,9 +51,15 @@ PRODUCT_ENDPOINTS: Mapping[str, str] = {
 
 TRANSACTIONS_PATH = "rest/transaction/list/pageable"
 TRANSACTION_PRODUCT_KINDS = frozenset({"account", "credit_card"})  # the only kinds with movements
+# Path segment of each product family in `/rest/{segment}/{id}/status` and friends.
+PRODUCT_PATHS: Mapping[str, str] = {kind: endpoint.split("/")[1] for kind, endpoint in PRODUCT_ENDPOINTS.items()}
+
 DEFAULT_PAGE_SIZE = 100  # the server caps `size` at 100
+MAX_2FA_ATTEMPTS = 3
 
 Relogin = Callable[[Session], Session]
+# Returns the code, "" to confirm a push approval, or None to leave that bank waiting.
+SecondFactorHandler = Callable[[SecondFactorRequest], str | None]
 
 
 class FintonicClient:
@@ -74,10 +99,15 @@ class FintonicClient:
         base = BFF_BASE if bff else API_BASE
         return self._request("GET", f"{base}/{path.lstrip('/')}", params=params)
 
-    def post(self, path: str, body: Any = None, *, bff: bool = False) -> Any:
+    def post(self, path: str, body: Any = None, *, bff: bool = False, params: Any = None) -> Any:
         """Not retried by the transport: writes must not be replayed blindly."""
         base = BFF_BASE if bff else API_BASE
-        return self._request("POST", f"{base}/{path.lstrip('/')}", json=body)
+        return self._request("POST", f"{base}/{path.lstrip('/')}", json=body, params=params)
+
+    def put(self, path: str, body: Any = None, *, bff: bool = False) -> Any:
+        """Not retried by the transport (see `post`)."""
+        base = BFF_BASE if bff else API_BASE
+        return self._request("PUT", f"{base}/{path.lstrip('/')}", json=body)
 
     def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         refreshed = self._session.is_expired()
@@ -115,17 +145,68 @@ class FintonicClient:
         """Open-banking sync status per bank (BFF)."""
         return self.get("openbanking/aggregations/", bff=True)
 
+    def aggregation(self, bank_id: str) -> dict[str, Any]:
+        """The aggregation of one bank (`entityId` is the bank id shown by `fintonic banks`)."""
+        return find_aggregation(self.aggregations(), bank_id)
+
     def refresh_banks(self) -> None:
         """Ask every connected bank to sync, like Perfil > Entidades > Actualizar."""
         self.post("openbanking/aggregations/data-actualizations", bff=True)
 
+    def refresh_bank(self, bank_id: str) -> None:
+        """Ask a single bank to sync."""
+        aggregation_id = self.aggregation(bank_id)["id"]
+        self.post(f"openbanking/aggregations/{aggregation_id}/data-actualizations", bff=True)
+
+    def submit_second_factor(self, aggregation_id: str, otp: str | None) -> None:
+        """Answer the bank's 2FA: a code, or None/"" to confirm an approval made in the bank app."""
+        self.put(f"openbanking/aggregations/{aggregation_id}/2fa", second_factor_body(otp), bff=True)
+
     def wait_for_banks(
-        self, *, timeout: float = 300, interval: float = 2, sleep: Callable[[float], None] = time.sleep
+        self,
+        *,
+        timeout: float = 300,
+        interval: float = 2,
+        sleep: Callable[[float], None] = time.sleep,
+        bank_ids: Collection[str] | None = None,
+        on_2fa: SecondFactorHandler | None = None,
+        answered: Mapping[str, Any] | None = None,
     ) -> AggregationStatus:
-        """Poll until no bank is syncing (banks waiting for 2FA are reported, not awaited)."""
+        """Poll until no bank (of `bank_ids`, default all) is syncing.
+
+        Banks waiting for 2FA are reported, not awaited, unless `on_2fa` answers them: the
+        answer is sent and the bank counts as syncing until its status changes. `answered`
+        maps banks already answered elsewhere to the status they had at that moment.
+        """
         deadline = time.monotonic() + timeout
+        answered_at: dict[str, Any] = dict(answered or {})  # bank id -> status when answered
+        attempts: Counter[str] = Counter()
+        skipped: set[str] = set()
         while True:
-            status = evaluate(self.aggregations())
+            aggs = [a for a in self.aggregations() if bank_ids is None or entity_id(a) in bank_ids]
+            awaiting = {
+                bank for a in aggs if (bank := entity_id(a)) in answered_at and answered_at[bank] == a.get("status")
+            }
+            askable = [
+                agg
+                for agg in aggs
+                if (needs_2fa(agg) or is_invalid_2fa(agg))
+                and entity_id(agg) not in awaiting | skipped
+                and attempts[entity_id(agg)] < MAX_2FA_ATTEMPTS
+            ]
+            for agg in askable:
+                if on_2fa is None:
+                    break
+                bank = entity_id(agg)
+                answer = on_2fa(SecondFactorRequest.from_aggregation(agg))
+                if answer is None:
+                    skipped.add(bank)
+                    continue
+                self.submit_second_factor(str(agg["id"]), answer)
+                answered_at[bank] = agg.get("status")
+                attempts[bank] += 1
+                awaiting.add(bank)
+            status = evaluate(aggs, awaiting=awaiting)
             if status.done or time.monotonic() >= deadline:
                 return status
             sleep(interval)
@@ -147,6 +228,29 @@ class FintonicClient:
                 return p
         raise InputError(f"No existe el producto {product_id}. Mira los ids con `fintonic products --all`.")
 
+    def set_product_visible(self, product: Product, visible: bool) -> None:
+        """Show or hide a product, like disabling an account in the app (`{"active": bool}`)."""
+        self.post(f"rest/{PRODUCT_PATHS[product.kind]}/{product.id}/status", {"active": visible})
+
+    def set_bank_products_visible(self, bank_id: str, kind: str, visible: bool) -> None:
+        """Show or hide every product of one family (`kind`) in a bank."""
+        try:
+            segment = PRODUCT_PATHS[kind]
+        except KeyError as exc:
+            raise InputError(f"Tipo de producto desconocido: {kind}. Opciones: {', '.join(PRODUCT_PATHS)}") from exc
+        self.post(f"rest/{segment}/all/status", {"active": visible}, params={"bankId": bank_id})
+
+    def mandates(self) -> list[Mandate]:
+        """Direct-debit mandates (recibos domiciliados) detected by Fintonic."""
+        body = self.get("rest/directDebit/mandates") or {}
+        return [Mandate.model_validate(raw) for raw in body.get("data") or []]
+
+    def mandate(self, mandate_id: str) -> Mandate:
+        data = (self.get(f"rest/directDebit/mandates/{mandate_id}") or {}).get("data")
+        if not data:
+            raise InputError(f"No existe el recibo domiciliado {mandate_id}.")
+        return Mandate.model_validate(data)
+
     def position(self) -> Position:
         return Position.model_validate(self.get("rest/overview/position")["data"])
 
@@ -164,6 +268,13 @@ class FintonicClient:
             if raw.get("id") == tx_id:
                 return Transaction.model_validate(raw)
         raise InputError(f"No existe el movimiento {tx_id}.")
+
+    def category_suggestions(self, tx_id: str) -> list[CategorySuggestion]:
+        """Categories Fintonic's classifier proposes for a movement, most likely first."""
+        body = self.get("rest/category/probability", {"transactionId": tx_id}) or {}
+        raw = (body.get("data") or {}).get("categories") or []
+        suggestions = [CategorySuggestion.model_validate(item) for item in raw]
+        return sorted(suggestions, key=lambda s: s.probability, reverse=True)
 
     def set_category(self, tx_id: str, category_id: str, *, apply_to_similar: bool = False) -> None:
         """Recategorize one movement; `apply_to_similar` creates a rule (web: "aplicar a todos")."""

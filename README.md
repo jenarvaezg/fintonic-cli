@@ -19,7 +19,7 @@ fintonic status
 
 fintonic position [--history]                  # saldos por tipo de producto
 fintonic banks                                 # bancos conectados y estado de sincronización
-fintonic products [account|credit_card|loan|...] [--all]   # sin tipo = todos; --all incluye cancelados
+fintonic products [account|credit_card|loan|...] [--all]   # sin tipo = todos; --all incluye cancelados y ocultos
 fintonic categories [--all]
 fintonic transactions --from 2026-10-01 --to 2026-10-31 -c G0898 -s mercadona -n 0 -f csv
 fintonic transactions --product <id> --unread  # id de cuenta o tarjeta de `fintonic products`
@@ -28,10 +28,17 @@ fintonic transactions --max -100               # gastos de 100 € o más (impor
 fintonic transactions --amount -12,50          # importe exacto; o rango: --amount -100..-50, 100.., ..-20
 fintonic transactions --unclassified | --direct-debit
 fintonic summary --month 2026-10 [--group parent] [--exclude-bank 2091] [--exclude-product <id>]
-fintonic refresh [--no-wait] [--timeout 300]  # sincronizar bancos y esperar (avisa de 2FA pendiente)
+fintonic mandates [<mandateId>]                # recibos domiciliados detectados por Fintonic
+fintonic tx show <id>                          # detalle: fechas, producto, partes si está dividido
+fintonic tx suggest <id>                       # categorías que propone Fintonic, con probabilidad
+
+fintonic refresh [--bank 0182] [--no-wait] [--timeout 300] [--no-2fa]
+fintonic bank-2fa 0182 123456                  # enviar el código 2FA que pide el banco al sincronizar
+fintonic bank-2fa 0182                         # banco con aprobación en su app: confirmar que ya está aprobado
 
 # Escritura (modifica tu cuenta)
-fintonic tx show <id>                          # detalle: fechas, producto, partes si está dividido
+fintonic products hide <id>... | --bank 0182 [--kind credit_card]   # ocultar (como desactivar en la app)
+fintonic products show <id>... | --bank 0182 [--kind credit_card]
 fintonic tx set-category <id> G0898 [--similar]  # --similar crea regla para movimientos parecidos
 fintonic tx split <id> G0898:85 G0101:195       # 2-3 partes en euros positivos; deben sumar el total
 fintonic tx describe <id> "Cena cumple"
@@ -95,8 +102,10 @@ Base `https://api.fintonic.com/finapi`, `Accept: application/vnd.fintonic-v7+jso
 | GET | `/rest/transaction/list/pageable` | página de Spring (`content`, `last`, `totalElements`…); `page`, `size` (máx. 100), `sort=userDate,asc\|desc`, `beginDate`, `endDate`, `categoryId` (repetible, OR), `queryText`, `bankId`, `ccc`, `cardNumber`, `read`, `minAmount`/`maxAmount` (céntimos con signo), `unclassified`, `onlyDirectDebit`, `transactionIds`… |
 | GET | `/rest/transaction/list` · `listByBank/{bankId}` | lo que usa la web: `pageLimit`, `pageOffset` y menos filtros (ya no se usa) |
 | GET | `/rest/transaction/olderNewerTransactionUserDate` | rango de fechas disponible |
+| GET | `/rest/category/probability?transactionId=…` | `data.categories: [{id, probability}]` (0..1) → `tx suggest` |
+| GET | `/rest/directDebit/mandates` · `/mandates/{mandateId}` | `data`: `{mandateId, bankId, businessName, categoryId, status, userId}` → `mandates` |
 
-Escritura (todas `POST`, nunca se reintentan):
+Escritura (`POST`/`PUT`, nunca se reintentan):
 
 | Ruta | Body |
 |---|---|
@@ -105,11 +114,23 @@ Escritura (todas `POST`, nunca se reintentan):
 | `/rest/transaction/{id}/split` | `{categoryIds: [...], categoryAmounts: [...]}` céntimos con el signo del movimiento |
 | `/rest/transaction/{id}/primaryDisplay` · `secondaryDisplay` | `{textFieldValue}` (concepto · nota) |
 | `/rest/transaction/{id}/markAsRead` · `markAsReadByBank/{bankId}` · `markAsReadByUser` | — |
-| BFF `/openbanking/aggregations/data-actualizations` | — refresca bancos; luego sondear `GET /openbanking/aggregations/` hasta que no haya `IN_PROGRESS` |
+| `/rest/{account,creditcard,deposit,fund,loan,share,pensionplan}/{id}/status` | `{active: bool}` — ocultar/mostrar un producto |
+| `/rest/{tipo}/all/status?bankId=…` | `{active: bool}` — todos los productos de ese tipo en un banco |
 
-Otros GET útiles: `/rest/transaction/listByIds?transactionIds=…`, `/rest/stats/getAllByRange?beginDate&endDate` (ingresos/gastos por categoría calculados por Fintonic; `summary` coincide al céntimo), `/rest/category/probability?transactionId=…`.
+### Sincronización de bancos (BFF `https://fintonic-pfm-bff.fintonic.com`)
 
-BFF `https://fintonic-pfm-bff.fintonic.com`: `user-insights`, `score/history`, `insurances`, `openbanking/aggregations/`.
+| Método | Ruta | Notas |
+|---|---|---|
+| GET | `/openbanking/aggregations/` | una por banco: `id` (aggregationId), `entityId` (= bank_id), `status {general, detail, reason, readiness}`, `aggregationWay {mfaMessage, mfaPlaceHolder, mfaHelp}` |
+| POST | `/openbanking/aggregations/data-actualizations` | refresca todos los bancos; luego sondear hasta que no haya `IN_PROGRESS` |
+| POST | `/openbanking/aggregations/{aggregationId}/data-actualizations` | refresca un banco (`refresh --bank`) |
+| PUT | `/openbanking/aggregations/{aggregationId}/2fa` | `{otp}` con el código; `{}` confirma una aprobación hecha en la app del banco |
+
+Reglas de 2FA (de la app Android): espera 2FA si `status.detail == "2FA"`; `reason` `WAITING_PARAM` pide código y `BACKGROUND_WAITING_PARAM` aprobación en la app del banco; `detail == "INVALID_2FA"` o `reason` `INVALID_*`/`TIMEOUT_*`/`CANCELLED_*` indica respuesta rechazada o caducada. `refresh` pregunta el código en una terminal interactiva (hasta 3 intentos por banco); con `--no-2fa` o sin terminal solo avisa.
+
+**Fuera de alcance a propósito**: `PUT /openbanking/aggregations/{id}/credential` (actualizar usuario/contraseña del banco). Este CLI no maneja contraseñas bancarias; cámbialas en la app.
+
+Otros GET útiles: `/rest/transaction/listByIds?transactionIds=…`, `/rest/stats/getAllByRange?beginDate&endDate` (ingresos/gastos por categoría calculados por Fintonic; `summary` coincide al céntimo). BFF: `user-insights`, `score/history`, `insurances`.
 
 ## Desarrollo
 

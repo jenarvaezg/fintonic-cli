@@ -14,8 +14,11 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 
+from fintonic.aggregation import SecondFactorRequest, is_invalid_2fa, needs_2fa
 from fintonic.amounts import amount_bounds
 from fintonic.auth import Authenticator, stored_pin_relogin
+from fintonic.cli_group import DefaultCommandGroup
+from fintonic.cli_sync import ask_second_factor, wait_and_report
 from fintonic.client import PRODUCT_ENDPOINTS, TRANSACTION_PRODUCT_KINDS, FintonicClient
 from fintonic.errors import (
     DeviceVerificationRequired,
@@ -25,7 +28,7 @@ from fintonic.errors import (
     SessionExpiredError,
 )
 from fintonic.http import build_http_client
-from fintonic.models import Category, Transaction, cents_to_decimal
+from fintonic.models import Category, Product, Transaction, cents_to_decimal
 from fintonic.output import OutputFormat, format_eur, print_json, render
 from fintonic.session import Session
 from fintonic.split import parse_part
@@ -278,11 +281,22 @@ def banks(fmt: FormatOpt = OutputFormat.table) -> None:
     render(rows, fmt, title="Bancos")
 
 
-@app.command()
+products_app = typer.Typer(
+    cls=DefaultCommandGroup,
+    help="Cuentas, tarjetas, préstamos, fondos... (`products [TIPO]` lista; `hide`/`show` los ocultan o muestran).",
+)
+app.add_typer(products_app, name="products")
+
+
+def _product_state(p: Product) -> str:
+    return "cancelado" if p.canceled else "oculto"
+
+
+@products_app.command("list")
 def products(
     kind: Annotated[str | None, typer.Argument(help=f"Uno de: {', '.join(PRODUCT_ENDPOINTS)}. Vacío = todos.")] = None,
     fmt: FormatOpt = OutputFormat.table,
-    all_: Annotated[bool, typer.Option("--all", help="Incluir productos cancelados o inactivos.")] = False,
+    all_: Annotated[bool, typer.Option("--all", help="Incluir productos cancelados u ocultos.")] = False,
 ) -> None:
     """Cuentas, tarjetas, préstamos, fondos... con su saldo."""
     with _client() as client:
@@ -300,11 +314,96 @@ def products(
             "nombre": p.name,
             "número": p.masked_number,
             "saldo": format_eur(p.balance) if table else p.balance,
-            **({} if p.is_live else {"estado": "cancelado"}),
+            # Every row needs the column: tables and CSV take their columns from the first row.
+            **({"estado": "" if p.is_live else _product_state(p)} if all_ else {}),
         }
         for p in items
     ]
     render(rows, fmt, title="Productos")
+
+
+ProductIdsArg = Annotated[list[str] | None, typer.Argument(help="ids de producto (ver `fintonic products --all`).")]
+BankOpt = Annotated[str | None, typer.Option("--bank", help="Todos los productos de este banco.")]
+KindOpt = Annotated[str | None, typer.Option("--kind", help=f"Con --bank: solo {', '.join(PRODUCT_ENDPOINTS)}.")]
+
+
+def _set_visibility(product_ids: list[str] | None, bank: str | None, kind: str | None, *, visible: bool) -> None:
+    if product_ids and bank:
+        raise typer.BadParameter("Usa ids o --bank, pero no ambos.")
+    if not product_ids and not bank:
+        raise typer.BadParameter("Indica ids de producto o --bank.")
+    if kind and not bank:
+        raise typer.BadParameter("--kind solo tiene sentido con --bank.")
+    if kind and kind not in PRODUCT_ENDPOINTS:
+        raise typer.BadParameter(f"Tipo desconocido: {kind}. Opciones: {', '.join(PRODUCT_ENDPOINTS)}.")
+    with _client() as client:
+        catalog = client.all_products()
+        if bank:
+            kinds = [kind] if kind else sorted({p.kind for p in catalog if p.bank_id == bank})
+            if not kinds:
+                raise InputError(f"El banco {bank} no tiene productos.")
+            for k in kinds:
+                client.set_bank_products_visible(bank, k, visible)
+        else:
+            by_id = {p.id: p for p in catalog}
+            unknown = [pid for pid in product_ids or [] if pid not in by_id]
+            if unknown:
+                raise InputError(f"No existen los productos: {', '.join(unknown)}. Mira `fintonic products --all`.")
+            for pid in product_ids or []:
+                client.set_product_visible(by_id[pid], visible)
+    err.print(f"[green]{'Visibles' if visible else 'Ocultos'}.[/green]")
+
+
+@products_app.command("hide")
+def products_hide(product_ids: ProductIdsArg = None, bank: BankOpt = None, kind: KindOpt = None) -> None:
+    """Oculta productos, como desactivar una cuenta en la app (no borra nada)."""
+    _set_visibility(product_ids, bank, kind, visible=False)
+
+
+@products_app.command("show")
+def products_show(product_ids: ProductIdsArg = None, bank: BankOpt = None, kind: KindOpt = None) -> None:
+    """Vuelve a mostrar productos ocultos."""
+    _set_visibility(product_ids, bank, kind, visible=True)
+
+
+@app.command()
+def mandates(
+    mandate_id: Annotated[str | None, typer.Argument(help="id de un recibo para ver solo ese.")] = None,
+    fmt: FormatOpt = OutputFormat.table,
+) -> None:
+    """Recibos domiciliados (mandatos de domiciliación) que Fintonic ha detectado."""
+    with _client() as client:
+        items = [client.mandate(mandate_id)] if mandate_id else client.mandates()
+        cats = client.categories() if items else {}
+
+    def cat_name(cid: str | None) -> str | None:
+        return cats[cid].name if cid in cats else cid
+
+    if fmt is OutputFormat.json:
+        dumped = [
+            {
+                "mandate_id": m.mandate_id,
+                "bank_id": m.bank_id,
+                "business_name": m.business_name,
+                "category_id": m.category_id,
+                "category": cat_name(m.category_id),
+                "status": m.status,
+            }
+            for m in items
+        ]
+        print_json(dumped[0] if mandate_id else dumped)
+        return
+    rows = [
+        {
+            "id": m.mandate_id,
+            "banco": m.bank_id,
+            "acreedor": m.business_name,
+            "categoría": cat_name(m.category_id) or "",
+            "estado": m.status,
+        }
+        for m in items
+    ]
+    render(rows, fmt, title="Recibos domiciliados")
 
 
 @app.command()
@@ -564,6 +663,27 @@ def tx_show(
     render([{"campo": k, "valor": v} for k, v in fields.items()], fmt, title=f"Movimiento {t.id}")
 
 
+@tx_app.command("suggest")
+def tx_suggest(
+    tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
+    fmt: FormatOpt = OutputFormat.table,
+) -> None:
+    """Categorías que Fintonic propone para un movimiento, de más a menos probable (solo lectura)."""
+    with _client() as client:
+        suggestions = client.category_suggestions(tx_id)
+        cats = client.categories() if suggestions else {}
+    table = fmt is OutputFormat.table
+    rows = [
+        {
+            "id": s.id,
+            "categoría": cats[s.id].name if s.id in cats else "",
+            "probabilidad": f"{s.probability:.0%}" if table else round(s.probability, 4),
+        }
+        for s in suggestions
+    ]
+    render(rows, fmt, title=f"Sugerencias para {tx_id}")
+
+
 @tx_app.command("set-category")
 def tx_set_category(
     tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
@@ -634,26 +754,60 @@ def tx_mark_read(
 
 @app.command()
 def refresh(
+    bank: Annotated[str | None, typer.Option("--bank", help="Solo este banco (bank_id de `fintonic banks`).")] = None,
     wait: Annotated[bool, typer.Option(help="Esperar a que terminen de sincronizar.")] = True,
     timeout: Annotated[int, typer.Option(help="Segundos máximos de espera.")] = 300,
+    ask_2fa: Annotated[
+        bool,
+        typer.Option("--2fa/--no-2fa", help="Si un banco pide 2FA, pedir aquí el código (solo en terminal)."),
+    ] = True,
 ) -> None:
-    """Pide a todos los bancos que sincronicen (Perfil > Entidades > Actualizar)."""
+    """Pide a los bancos que sincronicen (Perfil > Entidades > Actualizar) y espera."""
     with _client() as client:
-        client.refresh_banks()
+        if bank:
+            client.refresh_bank(bank)
+        else:
+            client.refresh_banks()
         if not wait:
             err.print("Actualización solicitada.")
             return
-        with err.status("Sincronizando bancos…"):
-            status = client.wait_for_banks(timeout=timeout)
-    if status.needs_2fa:
-        err.print(f"[yellow]Requieren aprobar 2FA en la app del banco: {', '.join(status.needs_2fa)}[/yellow]")
-    if status.errors:
-        err.print(f"[red]Con error: {', '.join(status.errors)}[/red]")
-    if status.in_progress:
-        err.print(f"[yellow]Siguen sincronizando tras {timeout}s: {', '.join(status.in_progress)}[/yellow]")
-        raise typer.Exit(2)
-    if not status.errors:
-        err.print("[green]Bancos actualizados.[/green]")
+        wait_and_report(
+            client,
+            err,
+            timeout=timeout,
+            bank_ids=[bank] if bank else None,
+            interactive=ask_2fa and _stdin_is_tty(),
+        )
+
+
+@app.command("bank-2fa")
+def bank_2fa(
+    bank_id: Annotated[str, typer.Argument(help="bank_id que espera 2FA (ver `fintonic refresh`).")],
+    code: Annotated[
+        str | None,
+        typer.Argument(help="Código del banco. Sin código, confirma que ya lo aprobaste en la app del banco."),
+    ] = None,
+    wait: Annotated[bool, typer.Option(help="Esperar a que termine de sincronizar.")] = True,
+    timeout: Annotated[int, typer.Option(help="Segundos máximos de espera.")] = 300,
+) -> None:
+    """Envía el código 2FA que pide un banco al sincronizar."""
+    with _client() as client:
+        aggregation = client.aggregation(bank_id)
+        if not (needs_2fa(aggregation) or is_invalid_2fa(aggregation)):
+            raise InputError(f"El banco {bank_id} no está esperando 2FA.")
+        request = SecondFactorRequest.from_aggregation(aggregation)
+        if code is None and not request.push:
+            if not _stdin_is_tty():
+                raise InputError(f"El banco {bank_id} pide un código: `fintonic bank-2fa {bank_id} CODIGO`.")
+            code = ask_second_factor(err, request)
+            if code is None:
+                err.print("Sin código: no se envía nada.")
+                return
+        client.submit_second_factor(request.aggregation_id, code)
+        err.print("Respuesta enviada al banco.")
+        if wait:
+            answered = {bank_id: aggregation.get("status")}
+            wait_and_report(client, err, timeout=timeout, bank_ids=[bank_id], answered=answered)
 
 
 def main() -> None:
