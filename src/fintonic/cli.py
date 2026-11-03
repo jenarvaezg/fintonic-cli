@@ -78,6 +78,11 @@ def _client(store: SessionStore | None = None) -> FintonicClient:
     return FintonicClient(session, http=http, store=store, relogin=relogin)
 
 
+def _local_time(moment: datetime | None) -> str:
+    """Session expiry is UTC; show it in the user's timezone, naming the zone."""
+    return moment.astimezone().strftime("%H:%M %Z") if moment else "?"
+
+
 def _parse_date(value: str | None) -> date | None:
     if not value:
         return None
@@ -136,7 +141,7 @@ def login(
             session = auth.verify_device(session, typer.prompt("Código SMS"))
 
     store.save(session)
-    err.print(f"[green]Sesión iniciada[/green] como {email} (caduca {session.expires_at:%H:%M}).")
+    err.print(f"[green]Sesión iniciada[/green] como {email} (caduca a las {_local_time(session.expires_at)}).")
 
 
 @app.command()
@@ -152,7 +157,7 @@ def verify(code: Annotated[str, typer.Argument(help="Código recibido por SMS.")
     with build_http_client() as http:
         session = Authenticator(http).verify_device(session, code)
     store.save(session)
-    err.print(f"[green]Dispositivo verificado.[/green] Sesión activa hasta las {session.expires_at:%H:%M}.")
+    err.print(f"[green]Dispositivo verificado.[/green] Sesión activa hasta las {_local_time(session.expires_at)}.")
 
 
 @app.command()
@@ -185,7 +190,7 @@ def status() -> None:
             "email": session.email,
             "store": type(store).__name__,
             "logged_in": bool(session.access_token) and not session.is_expired(),
-            "expires_at": expires.isoformat() if expires else None,
+            "expires_at": expires.astimezone().isoformat() if expires else None,
             "device_verified": session.device_verified,
             "auto_relogin": store.load_pin(session.email) is not None,
         }
@@ -442,6 +447,56 @@ tx_app = typer.Typer(no_args_is_help=True, help="Editar movimientos (escribe en 
 app.add_typer(tx_app, name="tx")
 
 
+@tx_app.command("show")
+def tx_show(
+    tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
+    fmt: FormatOpt = OutputFormat.table,
+) -> None:
+    """Detalle completo de un movimiento: fechas, producto, categorías y partes si está dividido."""
+    with _client() as client:
+        t = client.transaction(tx_id)
+        cats = client.categories()
+        product = _product_names(client, [t]).get(t.product_id)
+
+    def cat_name(cid: str) -> str:
+        return cats[cid].name if cid in cats else cid
+
+    if fmt is OutputFormat.json:
+        print_json(
+            {
+                **t.model_dump(by_alias=True, mode="json"),
+                "amount": t.amount,
+                "product": product,
+                "category": cat_name(t.category_id) if t.category_id else None,
+                "parts": [
+                    {"category_id": cid, "category": cat_name(cid), "amount": cents_to_decimal(c)}
+                    for cid, c in t.category_amounts.items()
+                ],
+            }
+        )
+        return
+
+    money = format_eur if fmt is OutputFormat.table else cents_to_decimal
+    parts = "; ".join(f"{cat_name(cid)} ({cid}) {money(c)}" for cid, c in t.category_amounts.items())
+    fields = {
+        "id": t.id,
+        "concepto": t.label,
+        "descripción banco": t.description,
+        "nota": t.secondary_display or t.note or "",
+        "importe": money(t.quantity),
+        "fecha": t.user_date,
+        "fecha valor": t.value_date,
+        "fecha operación": t.operation_date,
+        "categoría": f"{cat_name(t.category_id)} ({t.category_id})" if t.category_id else "",
+        "dividido": f"sí: {parts}" if t.is_split else "no",
+        "producto": product or t.product_id,
+        "banco": t.bank_id,
+        "tipo": t.type,
+        "leído": "sí" if t.read else "no",
+    }
+    render([{"campo": k, "valor": v} for k, v in fields.items()], fmt, title=f"Movimiento {t.id}")
+
+
 @tx_app.command("set-category")
 def tx_set_category(
     tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
@@ -493,17 +548,20 @@ def tx_note(tx_id: str, text: str) -> None:
 @tx_app.command("mark-read")
 def tx_mark_read(
     tx_ids: Annotated[list[str] | None, typer.Argument(help="ids a marcar como leídos.")] = None,
-    all_: Annotated[bool, typer.Option("--all", help="Marcar todos (o los de --bank).")] = False,
-    bank: Annotated[str | None, typer.Option("--bank", help="Con --all, solo este banco.")] = None,
+    all_: Annotated[bool, typer.Option("--all", help="Marcar todos los movimientos.")] = False,
+    bank: Annotated[str | None, typer.Option("--bank", help="Marcar todos los de este banco.")] = None,
 ) -> None:
-    """Marca movimientos como leídos."""
-    if not tx_ids and not all_:
-        raise typer.BadParameter("Indica ids o usa --all.")
+    """Marca como leídos unos movimientos, todos los de un banco (--bank) o todos (--all)."""
+    if tx_ids and (all_ or bank):
+        raise typer.BadParameter("Usa ids, --bank o --all, pero no ids junto con --bank/--all.")
+    if not tx_ids and not all_ and not bank:
+        raise typer.BadParameter("Indica ids, --bank o --all.")
     with _client() as client:
-        if all_:
+        if tx_ids:
+            for tx_id in tx_ids:
+                client.mark_read(tx_id)
+        else:
             client.mark_all_read(bank)
-        for tx_id in tx_ids or []:
-            client.mark_read(tx_id)
     err.print("[green]Hecho.[/green]")
 
 

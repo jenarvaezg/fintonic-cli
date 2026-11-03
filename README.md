@@ -27,11 +27,12 @@ fintonic summary --month 2026-10 [--group parent] [--exclude-bank 2091] [--exclu
 fintonic refresh [--no-wait] [--timeout 300]  # sincronizar bancos y esperar (avisa de 2FA pendiente)
 
 # Escritura (modifica tu cuenta)
+fintonic tx show <id>                          # detalle: fechas, producto, partes si está dividido
 fintonic tx set-category <id> G0898 [--similar]  # --similar crea regla para movimientos parecidos
 fintonic tx split <id> G0898:85 G0101:195       # 2-3 partes en euros positivos; deben sumar el total
 fintonic tx describe <id> "Cena cumple"
 fintonic tx note <id> "pagó Ana la mitad"
-fintonic tx mark-read <id>... | --all [--bank 0182]
+fintonic tx mark-read <id>... | --bank 0182 | --all
 
 fintonic raw rest/user/profile                 # GET arbitrario (exploración)
 fintonic raw user-insights --bff
