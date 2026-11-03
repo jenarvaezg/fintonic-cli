@@ -102,6 +102,9 @@ def test_show_unknown_transaction(mock_api: respx.MockRouter, store: MemorySessi
 
 
 def test_mark_read_bank_without_all(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
+    mock_api.get(f"{API}/rest/transaction/list/pageable", params={"bankId": "0182"}).mock(
+        return_value=httpx.Response(200, json={"content": [make_tx(1)], "last": True})
+    )
     bank = mock_api.post(f"{API}/rest/transaction/markAsReadByBank/0182").mock(return_value=httpx.Response(200))
     user = mock_api.post(f"{API}/rest/transaction/markAsReadByUser").mock(return_value=httpx.Response(200))
 
@@ -119,6 +122,11 @@ def test_mark_read_ids_with_bank_is_rejected(mock_api: respx.MockRouter, store: 
 
 
 def test_mark_read_ids_only(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
+    mock_api.get(f"{API}/rest/transaction/listByIds").mock(
+        side_effect=lambda request: httpx.Response(
+            200, json={"count": 1, "resultList": [make_tx(1, id=request.url.params["transactionIds"])]}
+        )
+    )
     one = mock_api.post(f"{API}/rest/transaction/tx1/markAsRead").mock(return_value=httpx.Response(200))
     two = mock_api.post(f"{API}/rest/transaction/tx2/markAsRead").mock(return_value=httpx.Response(200))
     assert runner.invoke(cli.app, ["tx", "mark-read", "tx1", "tx2"]).exit_code == 0
