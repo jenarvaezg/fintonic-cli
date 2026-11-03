@@ -63,10 +63,6 @@ def plan_undo(record: ChangeRecord, tx: Transaction, categories: Mapping[str, Ca
 def _check_category_target(target: Any, current: dict[str, int], tx: Transaction) -> None:
     if not isinstance(target, dict) or not target:
         raise UndoRefused("No se conoce la categoría anterior del movimiento.")
-    if len(target) == 1 and len(current) > 1:
-        raise UndoRefused(
-            "Habría que volver a unir un movimiento dividido y aún no se sabe si la API lo permite (#3). "
-            "Hazlo desde la app de Fintonic."
-        )
+    # A single target on a split movement is fine: setting one category joins it back (verified in #3).
     if len(target) > 1 and sum(target.values()) != tx.quantity:
         raise UndoRefused("Las partes anteriores ya no suman el importe del movimiento: no se puede volver a dividir.")

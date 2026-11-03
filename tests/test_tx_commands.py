@@ -236,6 +236,27 @@ def test_undo_set_category_restores_previous_split(
     assert undo.undoes == log.records()[0].timestamp
 
 
+def test_undo_split_joins_back_with_set_category(
+    mock_api: respx.MockRouter, store: MemorySessionStore, log: ChangeLog
+) -> None:
+    log.append(
+        ChangeRecord(
+            command="split",
+            tx_id="tx0001",
+            field="category",
+            before={"G0898": -1000},
+            after={"G0898": -600, "G0101": -400},
+        )
+    )
+    _serve_txs(mock_api, make_tx(1, quantity=-1000, categorization=_cats({"G0898": -600, "G0101": -400})))
+    join = mock_api.post(f"{API}/rest/transaction/tx0001/category").mock(return_value=httpx.Response(200))
+
+    result = runner.invoke(cli.app, ["tx", "undo", "tx0001"])
+
+    assert result.exit_code == 0, result.output
+    assert _body(join) == {"categoryId": "G0898"}
+
+
 @pytest.mark.parametrize(
     ("before", "after", "tx", "method", "path", "body"),
     [

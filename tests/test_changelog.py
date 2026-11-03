@@ -111,11 +111,12 @@ def test_undo_restores_previous_split() -> None:
     assert not plan.noop
 
 
-def test_undo_refuses_to_unsplit() -> None:
+def test_undo_of_split_joins_back_to_one_category() -> None:
+    """Setting one category on a split movement joins it (verified against the real API in #3)."""
     tx = _tx(quantity=-1000, categorization=_split({"G0898": -600, "G0101": -400}))
     record = _record(Field.category, {"G0898": -1000}, {"G0898": -600, "G0101": -400})
-    with pytest.raises(UndoRefused, match="#3"):
-        plan_undo(record, tx)
+    plan = plan_undo(record, tx)
+    assert plan.target == {"G0898": -1000}
 
 
 def test_undo_refuses_rules() -> None:
