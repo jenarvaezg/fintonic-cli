@@ -54,7 +54,7 @@ fintonic tx undo <id> [--dry-run]              # deshace el último cambio regis
 
 fintonic raw rest/user/profile                 # GET arbitrario (exploración)
 fintonic raw user-insights --bff
-fintonic logout [--forget-device]              # cierra también en el servidor
+fintonic logout [--forget-device]              # cierra también en el servidor (el token emitido caduca solo)
 ```
 
 ### Sin escritorio (Linux, CI, cron)
@@ -106,7 +106,7 @@ with FintonicClient(store.load(), store=store) as client:
 
 - **Reintentos por defecto**: `GET/HEAD/OPTIONS` se reintentan 4 veces con backoff exponencial + jitter ante `429/500/502/503/504`, timeouts y errores de red (respeta `Retry-After`). El login (`POST`) y el SMS (`PUT`) **nunca** se reintentan, para no gastar intentos de PIN ni cupo de SMS.
 - **Sesión en el Keychain** (`keyring`) o en un fichero 0600 si no hay keyring. El access token dura 30 min y **no hay endpoint de refresh**: en la app Android (11.9.1.0, `TokensRetrofit`) el único uso del `refresh_token` es `POST /oidc/logout`, y la app renueva la sesión re-logueando con el PIN guardado. Con `--remember` hacemos lo mismo; si ese re-login falla por credenciales, el PIN se borra al instante para no bloquear la cuenta.
-- **Logout en servidor**: `fintonic logout` borra primero la sesión local y después invalida el `refresh_token` con `/oidc/logout`. Es best-effort: si falla la red o Fintonic, avisa pero la sesión local ya está borrada. Las sesiones guardadas con versiones anteriores no tienen `refresh_token` y solo se cierran en local.
+- **Logout en servidor**: `fintonic logout` borra primero la sesión local y después invalida el `refresh_token` con `/oidc/logout`. Es best-effort: si falla la red o Fintonic, avisa pero la sesión local ya está borrada. Las sesiones guardadas con versiones anteriores no tienen `refresh_token` y solo se cierran en local. Ojo: el access token ya emitido **sigue siendo válido hasta que caduca** (≤ 30 min), porque la API valida el JWT sin consultar la sesión (verificado en #3; la app oficial se comporta igual).
 - **Cabeceras como la app Android** (`mc/c.java`): `finia_token` y `x-fintonic-user-code` (vienen en las cabeceras `finia_token` y `user-code` del login) en todas las peticiones, y `DEVICE-UUID` solo con el dispositivo verificado (y en `device/provisions` y `device/verification`, como la web). Timeouts de 60 s. El User-Agent sigue siendo el de Chrome: Cloudflare está delante de la API y el resto de cabeceras (`origin`, `referer`) son las de la web.
 - **Movimientos divididos**: `weightedCategories` son céntimos con signo por categoría que suman el total; `summary` reparte cada parte en su categoría. Las categorías `N*` (no computables: traspasos, inversiones, liquidación de tarjeta) se excluyen.
 - **Filtros en servidor**: `transactions` usa `list/pageable` (el de la app Android) y todos los filtros los aplica Fintonic. `product_id` de un movimiento es el `ccc` de la cuenta o el número de tarjeta, así que `--product` envía `ccc` o `cardNumber`; el resto de productos (préstamos, fondos…) no tienen movimientos.
@@ -122,7 +122,7 @@ Base `https://api.fintonic.com/finapi`, `Accept: application/vnd.fintonic-v7+jso
 | Método | Ruta | Notas |
 |---|---|---|
 | POST | `/oidc/token` | `{username, password, deviceUUID}` → tokens en `data`, `device-uuid`, `user-code` y `finia_token` en cabeceras |
-| POST | `/oidc/logout` | `{refresh_token}` → invalida la sesión (único uso del `refresh_token`) |
+| POST | `/oidc/logout` | `{refresh_token}` → cierra la sesión de Keycloak (único uso del `refresh_token`); el access token vive hasta caducar |
 | PUT | `/rest/device/provisions` | `{deviceUuid}` → envía SMS (202) |
 | PUT | `/rest/device/verification` | `{deviceUuid, verificationCode}` (202) |
 | GET | `/rest/user/profile` | |
