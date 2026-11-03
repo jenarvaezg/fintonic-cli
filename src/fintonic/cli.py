@@ -14,8 +14,9 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 
+from fintonic.amounts import amount_bounds
 from fintonic.auth import Authenticator, stored_pin_relogin
-from fintonic.client import PRODUCT_ENDPOINTS, FintonicClient
+from fintonic.client import PRODUCT_ENDPOINTS, TRANSACTION_PRODUCT_KINDS, FintonicClient
 from fintonic.errors import (
     DeviceVerificationRequired,
     FintonicError,
@@ -332,31 +333,60 @@ def _category_label(t: Transaction, cats: dict[str, Category]) -> str:
     return f"{name} +{len(t.category_amounts) - 1}" if t.is_split else name
 
 
-@app.command()
+AMOUNT_HELP = "Los importes llevan signo: los gastos son negativos (p.ej. --max -100 = gastos de 100 € o más)."
+
+
+@app.command(epilog=AMOUNT_HELP)
 def transactions(
     fmt: FormatOpt = OutputFormat.table,
     since: Annotated[str | None, typer.Option("--from", help="Fecha inicio YYYY-MM-DD.")] = None,
     until: Annotated[str | None, typer.Option("--to", help="Fecha fin YYYY-MM-DD.")] = None,
-    category: Annotated[str | None, typer.Option("--category", "-c", help="Id de categoría (p.ej. G0898).")] = None,
+    category: Annotated[
+        list[str] | None,
+        typer.Option("--category", "-c", help="Id de categoría (p.ej. G0898). Repetible: vale cualquiera."),
+    ] = None,
     search: Annotated[str | None, typer.Option("--search", "-s", help="Texto a buscar.")] = None,
     bank: Annotated[str | None, typer.Option("--bank", help="bank_id (ver `fintonic banks`).")] = None,
-    product: Annotated[str | None, typer.Option("--product", help="id de producto (ver `fintonic products`).")] = None,
+    product: Annotated[
+        str | None, typer.Option("--product", help="id de cuenta o tarjeta (ver `fintonic products`).")
+    ] = None,
     unread: Annotated[bool, typer.Option("--unread", help="Solo movimientos sin leer.")] = False,
+    minimum: Annotated[
+        str | None, typer.Option("--min", help="Importe mínimo en euros con signo (12,50 o -12.50).")
+    ] = None,
+    maximum: Annotated[str | None, typer.Option("--max", help="Importe máximo en euros con signo.")] = None,
+    amount: Annotated[
+        str | None,
+        typer.Option("--amount", help="Importe exacto (-12,50) o rango X..Y (-100..-50, 100.., ..-20)."),
+    ] = None,
+    unclassified: Annotated[bool, typer.Option("--unclassified", help="Solo movimientos sin categorizar.")] = False,
+    direct_debit: Annotated[bool, typer.Option("--direct-debit", help="Solo recibos domiciliados.")] = False,
+    oldest_first: Annotated[bool, typer.Option("--oldest-first", help="Del más antiguo al más reciente.")] = False,
     limit: Annotated[int | None, typer.Option("--limit", "-n", help="Máximo de movimientos (0 = todos).")] = 50,
 ) -> None:
-    """Movimientos, del más reciente al más antiguo."""
-    begin, end = _parse_date(since), _parse_date(until)  # validate input before any network call
+    """Movimientos, del más reciente al más antiguo (o al revés con --oldest-first). Filtra Fintonic."""
+    # validate input before any network call
+    begin, end = _parse_date(since), _parse_date(until)
+    min_amount, max_amount = amount_bounds(minimum, maximum, amount)
     with _client() as client:
         cats = client.categories()
+        selected = client.product(product) if product else None
+        if selected and selected.kind not in TRANSACTION_PRODUCT_KINDS:
+            err.print(f"[yellow]Solo cuentas y tarjetas tienen movimientos; este producto es {selected.kind}.[/yellow]")
         txs = list(
             client.transactions(
                 begin=begin,
                 end=end,
-                category_id=category,
+                category_ids=[c.upper() for c in category or []],
                 query=search,
                 bank_id=bank,
-                product=client.product(product) if product else None,
+                product=selected,
                 unread=unread,
+                min_amount=min_amount,
+                max_amount=max_amount,
+                unclassified=unclassified,
+                direct_debit=direct_debit,
+                oldest_first=oldest_first,
                 limit=limit or None,
             )
         )
