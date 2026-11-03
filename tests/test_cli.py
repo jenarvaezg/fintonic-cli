@@ -14,6 +14,7 @@ from fintonic.stores import FileSessionStore, MemorySessionStore
 from tests.conftest import API, DEVICE, make_jwt, make_tx
 
 runner = CliRunner()
+TX_LIST = f"{API}/rest/transaction/list/pageable"
 CATS = {"categoryTree": {"G0898": {"id": "G0898", "name": "Restaurante", "classified": True}}}
 
 
@@ -39,8 +40,8 @@ def test_transactions_json(mock_api: respx.MockRouter, store: MemorySessionStore
     split = make_tx(
         2, quantity=-1000, categorization={"weightedCategories": {"G0898": -700, "G0101": -300}, "splited": True}
     )
-    mock_api.get(f"{API}/rest/transaction/list").mock(
-        return_value=httpx.Response(200, json={"count": 2, "resultList": [make_tx(1, quantity=-1050), split]})
+    mock_api.get(TX_LIST).mock(
+        return_value=httpx.Response(200, json={"content": [make_tx(1, quantity=-1050), split], "last": True})
     )
     result = runner.invoke(cli.app, ["transactions", "-f", "json"])
     assert result.exit_code == 0, result.output
@@ -57,9 +58,7 @@ def test_transactions_table_marks_splits(mock_api: respx.MockRouter, store: Memo
     mock_api.get(f"{API}/rest/category/tree").mock(return_value=httpx.Response(200, json=CATS))
     mock_api.get(f"{API}/rest/account/listAccounts").mock(return_value=httpx.Response(200, json=ACCOUNTS))
     split = make_tx(2, quantity=-1000, categorization={"weightedCategories": {"G0898": -700, "G0101": -300}})
-    mock_api.get(f"{API}/rest/transaction/list").mock(
-        return_value=httpx.Response(200, json={"count": 1, "resultList": [split]})
-    )
+    mock_api.get(TX_LIST).mock(return_value=httpx.Response(200, json={"content": [split], "last": True}))
     result = runner.invoke(cli.app, ["transactions", "-f", "csv"])
     row = next(csv.DictReader(io.StringIO(result.stdout)))
     assert row["categoría"] == "Restaurante +1"
@@ -82,9 +81,7 @@ def test_summary_json(mock_api: respx.MockRouter, store: MemorySessionStore) -> 
         make_tx(4, quantity=-999, bankId="2091", categorization={"weightedCategories": {"G0898": -999}}),
     ]
     mock_api.get(f"{API}/rest/category/tree").mock(return_value=httpx.Response(200, json=tree))
-    route = mock_api.get(f"{API}/rest/transaction/list").mock(
-        return_value=httpx.Response(200, json={"count": 4, "resultList": txs})
-    )
+    route = mock_api.get(TX_LIST).mock(return_value=httpx.Response(200, json={"content": txs, "last": True}))
 
     result = runner.invoke(cli.app, ["summary", "--month", "2026-10", "--exclude-bank", "2091", "-f", "json"])
 
@@ -99,8 +96,8 @@ def test_summary_json(mock_api: respx.MockRouter, store: MemorySessionStore) -> 
 def test_transactions_csv(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
     mock_api.get(f"{API}/rest/category/tree").mock(return_value=httpx.Response(200, json=CATS))
     mock_api.get(f"{API}/rest/account/listAccounts").mock(return_value=httpx.Response(200, json=ACCOUNTS))
-    mock_api.get(f"{API}/rest/transaction/list").mock(
-        return_value=httpx.Response(200, json={"count": 2, "resultList": [make_tx(1), make_tx(2)]})
+    mock_api.get(TX_LIST).mock(
+        return_value=httpx.Response(200, json={"content": [make_tx(1), make_tx(2)], "last": True})
     )
     result = runner.invoke(cli.app, ["transactions", "-f", "csv", "--from", "2026-10-01"])
     assert result.exit_code == 0, result.output

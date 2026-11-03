@@ -13,11 +13,12 @@ from fintonic.session import Session
 from fintonic.stores import MemorySessionStore
 from tests.conftest import API, BFF, make_jwt, make_tx
 
-TX_LIST = f"{API}/rest/transaction/list"
+TX_LIST = f"{API}/rest/transaction/list/pageable"
 
 
-def _page(items: list[dict], count: int) -> httpx.Response:
-    return httpx.Response(200, json={"count": count, "resultList": items})
+def _page(items: list[dict], *, last: bool = True, number: int = 0) -> httpx.Response:
+    """A Spring page as returned by `list/pageable`."""
+    return httpx.Response(200, json={"content": items, "last": last, "number": number, "size": len(items)})
 
 
 def test_requires_token(session: Session) -> None:
@@ -33,49 +34,78 @@ def test_sends_auth_and_device_headers(mock_api: respx.MockRouter, http: httpx.C
     assert headers["device-uuid"] == session.device_uuid
 
 
-def test_transactions_paginate_until_count(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+def test_transactions_paginate_until_last(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
     txs = [make_tx(i) for i in range(5)]
-    route = mock_api.get(TX_LIST).mock(side_effect=[_page(txs[:2], 5), _page(txs[2:4], 5), _page(txs[4:], 5)])
+    route = mock_api.get(TX_LIST).mock(
+        side_effect=[_page(txs[:2], last=False), _page(txs[2:4], last=False, number=1), _page(txs[4:], number=2)]
+    )
 
     result = list(FintonicClient(session, http=http).transactions(page_size=2))
 
     assert [t.id for t in result] == [t["id"] for t in txs]
-    offsets = [int(c.request.url.params["pageOffset"]) for c in route.calls]
-    assert offsets == [0, 2, 4]
+    assert [int(c.request.url.params["page"]) for c in route.calls] == [0, 1, 2]
+    assert {c.request.url.params["size"] for c in route.calls} == {"2"}
 
 
 def test_transactions_stop_on_empty_page(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
-    route = mock_api.get(TX_LIST).mock(side_effect=[_page([make_tx(1)], 10), _page([], 10)])
+    route = mock_api.get(TX_LIST).mock(side_effect=[_page([make_tx(1)], last=False), _page([], last=False)])
     assert len(list(FintonicClient(session, http=http).transactions(page_size=1))) == 1
     assert route.call_count == 2
 
 
+def test_transactions_stop_when_last_is_missing(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session
+) -> None:
+    route = mock_api.get(TX_LIST).mock(return_value=httpx.Response(200, json={"content": [make_tx(1)]}))
+    assert len(list(FintonicClient(session, http=http).transactions())) == 1
+    assert route.call_count == 1
+
+
 def test_transactions_respect_limit(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
-    route = mock_api.get(TX_LIST).mock(return_value=_page([make_tx(i) for i in range(3)], 100))
+    route = mock_api.get(TX_LIST).mock(return_value=_page([make_tx(i) for i in range(3)], last=False))
     assert len(list(FintonicClient(session, http=http).transactions(limit=2, page_size=3))) == 2
     assert route.call_count == 1
+    assert route.calls.last.request.url.params["size"] == "2"  # don't fetch more than asked
 
 
 def test_transaction_filters_map_to_api_params(
     mock_api: respx.MockRouter, http: httpx.Client, session: Session
 ) -> None:
-    route = mock_api.get(TX_LIST).mock(return_value=_page([], 0))
+    route = mock_api.get(TX_LIST).mock(return_value=_page([]))
     list(
         FintonicClient(session, http=http).transactions(
-            begin=date(2026, 10, 1), end=date(2026, 10, 15), category_id="G0898", query="super"
+            begin=date(2026, 10, 1),
+            end=date(2026, 10, 15),
+            category_ids=["G0898", "G0501"],
+            query="super",
+            bank_id="0182",
+            min_amount=-10000,
+            max_amount=-1250,
+            unclassified=True,
+            direct_debit=True,
         )
     )
     params = route.calls.last.request.url.params
     assert params["beginDate"] == "2026-10-01"
     assert params["endDate"] == "2026-10-15"
-    assert params["categoryId"] == "G0898"
+    assert params.get_list("categoryId") == ["G0898", "G0501"]
     assert params["queryText"] == "super"
+    assert params["bankId"] == "0182"
+    assert (params["minAmount"], params["maxAmount"]) == ("-10000", "-1250")
+    assert (params["unclassified"], params["onlyDirectDebit"]) == ("true", "true")
+    assert params["sort"] == "userDate,desc"
 
 
-def test_transactions_by_bank(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
-    route = mock_api.get(f"{API}/rest/transaction/listByBank/0182").mock(return_value=_page([], 0))
-    list(FintonicClient(session, http=http).transactions(bank_id="0182"))
-    assert route.called
+def test_transactions_omit_unset_filters(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    route = mock_api.get(TX_LIST).mock(return_value=_page([]))
+    list(FintonicClient(session, http=http).transactions())
+    assert set(route.calls.last.request.url.params) == {"sort", "size", "page"}
+
+
+def test_transactions_oldest_first(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    route = mock_api.get(TX_LIST).mock(return_value=_page([]))
+    list(FintonicClient(session, http=http).transactions(oldest_first=True))
+    assert route.calls.last.request.url.params["sort"] == "userDate,asc"
 
 
 def test_split_category_is_largest_absolute_share() -> None:
@@ -89,24 +119,44 @@ def test_split_category_is_largest_absolute_share() -> None:
     assert tx.category_amounts == {"G0101": -100, "G0898": -900}
 
 
-def test_product_filter_is_client_side_within_bank(
-    mock_api: respx.MockRouter, http: httpx.Client, session: Session
+@pytest.mark.parametrize(
+    ("product", "expected"),
+    [
+        (Product(kind="account", id="a1", bankId="0182", ccc="ccc-mine"), {"ccc": "ccc-mine"}),
+        (Product(kind="credit_card", id="c1", bankId="0182", cardNumber="4111"), {"cardNumber": "4111"}),
+        (Product(kind="credit_card", id="c2", bankId="0182", displayCardNumber="4111"), {"cardNumber": "4111"}),
+    ],
+)
+def test_product_filter_is_server_side(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session, product: Product, expected: dict[str, str]
 ) -> None:
-    mine = make_tx(1, productId="ccc-mine")
-    other = make_tx(2, productId="ccc-other")
-    route = mock_api.get(f"{API}/rest/transaction/listByBank/0182").mock(
-        return_value=_page([other, mine, other, mine], 4)
-    )
-    product = Product(kind="account", id="a1", bankId="0182", ccc="ccc-mine")
+    route = mock_api.get(TX_LIST).mock(return_value=_page([make_tx(1)]))
 
-    result = list(FintonicClient(session, http=http).transactions(product=product, limit=1))
+    result = list(FintonicClient(session, http=http).transactions(product=product))
 
     assert [t.id for t in result] == ["tx0001"]
-    assert route.called
+    params = route.calls.last.request.url.params
+    assert {k: params[k] for k in expected} == expected
+    assert "bankId" not in params
+
+
+@pytest.mark.parametrize(
+    "product",
+    [
+        Product(kind="loan", id="l1", bankId="0182", accountNumber="123"),
+        Product(kind="account", id="a2", bankId="0182"),  # no ccc: an unfiltered query would list everything
+    ],
+)
+def test_products_without_movements_yield_nothing(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session, product: Product
+) -> None:
+    route = mock_api.get(TX_LIST).mock(return_value=_page([make_tx(1)]))
+    assert list(FintonicClient(session, http=http).transactions(product=product)) == []
+    assert not route.called
 
 
 def test_unread_filter(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
-    route = mock_api.get(TX_LIST).mock(return_value=_page([], 0))
+    route = mock_api.get(TX_LIST).mock(return_value=_page([]))
     list(FintonicClient(session, http=http).transactions(unread=True))
     assert route.calls.last.request.url.params["read"] == "false"
 

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import date
+from itertools import islice
 from typing import Any, Self
 
 import httpx
@@ -28,7 +29,9 @@ PRODUCT_ENDPOINTS: Mapping[str, str] = {
     "pension_plan": "rest/pensionplan/listPensionPlans",
 }
 
-DEFAULT_PAGE_SIZE = 100
+TRANSACTIONS_PATH = "rest/transaction/list/pageable"
+TRANSACTION_PRODUCT_KINDS = frozenset({"account", "credit_card"})  # the only kinds with movements
+DEFAULT_PAGE_SIZE = 100  # the server caps `size` at 100
 
 Relogin = Callable[[Session], Session]
 
@@ -194,49 +197,69 @@ class FintonicClient:
         *,
         begin: date | None = None,
         end: date | None = None,
-        category_id: str | None = None,
+        category_ids: Sequence[str] = (),
         query: str | None = None,
         bank_id: str | None = None,
         product: Product | None = None,
         unread: bool = False,
+        min_amount: int | None = None,
+        max_amount: int | None = None,
+        unclassified: bool = False,
+        direct_debit: bool = False,
+        oldest_first: bool = False,
         limit: int | None = None,
         page_size: int = DEFAULT_PAGE_SIZE,
     ) -> Iterator[Transaction]:
-        """Iterate transactions newest-first, paginating transparently.
+        """Iterate transactions newest-first (or oldest-first), paginating transparently.
 
-        `product` has no server-side filter that works with the ids the API exposes, so we
-        narrow by its bank and match `product_id` client-side.
+        Every filter runs server-side. `category_ids` match any of them; `min_amount` and
+        `max_amount` are signed cents (expenses are negative). Only accounts and credit cards
+        have movements: any other `product` yields nothing.
         """
-        bank_id = product.bank_id if product else bank_id
-        path = f"rest/transaction/listByBank/{bank_id}" if bank_id else "rest/transaction/list"
-        filters = _compact(
-            {
-                "beginDate": begin.isoformat() if begin else None,
-                "endDate": end.isoformat() if end else None,
-                "categoryId": category_id,
-                "queryText": query,
-                "read": "false" if unread else None,
-            }
-        )
-        keys = product.transaction_keys if product else None
-        yielded = 0
-        for tx in self._paginate(path, filters, page_size):
-            if keys is not None and tx.product_id not in keys:
-                continue
-            yield tx
-            yielded += 1
-            if limit is not None and yielded >= limit:
-                return
+        product_filter = _product_filter(product) if product else {}
+        if product_filter is None:
+            return
+        filters: list[tuple[str, Any]] = [
+            *_compact(
+                {
+                    "beginDate": begin.isoformat() if begin else None,
+                    "endDate": end.isoformat() if end else None,
+                    "queryText": query,
+                    "bankId": bank_id,
+                    "read": "false" if unread else None,
+                    "minAmount": min_amount,
+                    "maxAmount": max_amount,
+                    "unclassified": "true" if unclassified else None,
+                    "onlyDirectDebit": "true" if direct_debit else None,
+                    **product_filter,
+                }
+            ).items(),
+            *(("categoryId", cid) for cid in category_ids),
+            ("sort", f"userDate,{'asc' if oldest_first else 'desc'}"),
+        ]
+        size = min(page_size, limit) if limit else page_size
+        yield from islice(self._paginate(TRANSACTIONS_PATH, filters, size), limit)
 
-    def _paginate(self, path: str, filters: Mapping[str, Any], page_size: int) -> Iterator[Transaction]:
-        offset = 0
+    def _paginate(self, path: str, filters: list[tuple[str, Any]], size: int) -> Iterator[Transaction]:
+        """Walk a Spring page response (`content`, `last`) until the last or an empty page."""
+        page = 0
         while True:
-            body = self.get(path, {**filters, "pageLimit": page_size, "pageOffset": offset})
-            items = body.get("resultList") or []
+            body = self.get(path, [*filters, ("size", size), ("page", page)])
+            items = body.get("content") or []
             yield from (Transaction.model_validate(raw) for raw in items)
-            offset += len(items)
-            if not items or offset >= int(body.get("count") or 0):
+            if not items or body.get("last", True):
                 return
+            page += 1
+
+
+def _product_filter(product: Product) -> dict[str, str] | None:
+    """Server-side filter for a product's movements, or None if it has none (loans, funds...)."""
+    if product.kind == "account" and product.ccc:
+        return {"ccc": product.ccc}
+    card = product.card_number or product.display_card_number
+    if product.kind == "credit_card" and card:
+        return {"cardNumber": card}
+    return None
 
 
 def _compact(params: Mapping[str, Any]) -> dict[str, Any]:
