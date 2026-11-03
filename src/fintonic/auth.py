@@ -17,7 +17,9 @@ import httpx
 
 from fintonic.config import API_BASE
 from fintonic.errors import (
+    ApiError,
     AuthError,
+    BlockedUserError,
     DeviceVerificationRequired,
     InvalidCredentialsError,
     SessionExpiredError,
@@ -49,6 +51,11 @@ class Authenticator:
             raise_for_response(response)
         except SessionExpiredError as exc:
             raise InvalidCredentialsError() from exc
+        except ApiError as exc:
+            # Any other client error from the password grant is a rejection; 429/5xx are transient.
+            if 400 <= exc.status < 500 and exc.status != 429:
+                raise InvalidCredentialsError(exc.message) from exc
+            raise
 
         data = (response.json() or {}).get("data") or {}
         if data.get("error"):
@@ -109,7 +116,7 @@ def stored_pin_relogin(auth: Authenticator, store: SessionStore) -> Callable[[Se
             raise SessionExpiredError()
         try:
             result = auth.login(current.email, pin, previous=current)
-        except AuthError as exc:
+        except (InvalidCredentialsError, BlockedUserError) as exc:
             store.delete_pin(current.email)
             raise AuthError(
                 f"El re-login automático ha fallado ({exc}). He borrado el PIN guardado para no bloquear "

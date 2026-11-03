@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
+import tempfile
+from collections.abc import Callable, Iterator
 from dataclasses import asdict
 from enum import StrEnum
 from pathlib import Path
@@ -12,6 +16,7 @@ from typing import Any, Protocol
 import keyring
 
 from fintonic.config import KEYRING_SERVICE
+from fintonic.errors import CorruptStoreError
 from fintonic.session import Session
 
 _NO_KEYRING_MODULES = {"keyring.backends.fail", "keyring.backends.null"}
@@ -66,42 +71,69 @@ class FileSessionStore:
     def __init__(self, path: Path) -> None:
         self.path = path
 
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Serialize read-modify-write across processes (e.g. two cron jobs re-logging in)."""
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(self.path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def _read(self) -> dict[str, Any]:
         if not self.path.exists():
             return {}
-        return json.loads(self.path.read_text())
+        try:
+            data = json.loads(self.path.read_text())
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            raise CorruptStoreError(self.path) from exc
+        if not isinstance(data, dict):
+            raise CorruptStoreError(self.path)
+        return data
 
     def _write(self, data: dict[str, Any]) -> None:
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh)
-        os.replace(tmp, self.path)
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".session-", suffix=".tmp")  # unique, 0600
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(data, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+            raise
+
+    def _update(self, change: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
+        with self._locked():
+            self._write(change(self._read()))
 
     def load(self) -> Session | None:
         raw = self._read().get("session")
-        return Session.from_dict(raw) if raw else None
+        if raw is None:
+            return None
+        try:
+            return Session.from_dict(raw)
+        except (TypeError, AttributeError) as exc:
+            raise CorruptStoreError(self.path) from exc
 
     def save(self, session: Session) -> None:
-        self._write({**self._read(), "session": asdict(session)})
+        self._update(lambda data: {**data, "session": asdict(session)})
 
     def clear(self) -> None:
-        data = self._read()
-        data.pop("session", None)
-        self._write(data)
+        self._update(lambda data: {k: v for k, v in data.items() if k != "session"})
 
     def load_pin(self, email: str) -> str | None:
         return self._read().get("pins", {}).get(email)
 
     def save_pin(self, email: str, pin: str) -> None:
-        data = self._read()
-        self._write({**data, "pins": {**data.get("pins", {}), email: pin}})
+        self._update(lambda data: {**data, "pins": {**data.get("pins", {}), email: pin}})
 
     def delete_pin(self, email: str) -> None:
-        data = self._read()
-        pins = {k: v for k, v in data.get("pins", {}).items() if k != email}
-        self._write({**data, "pins": pins})
+        self._update(lambda data: {**data, "pins": {k: v for k, v in data.get("pins", {}).items() if k != email}})
 
 
 class MemorySessionStore:

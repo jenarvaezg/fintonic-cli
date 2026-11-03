@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import socket
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -59,6 +60,17 @@ def make_tx(i: int, **overrides: Any) -> dict[str, Any]:
         },
     }
     return {**base, **overrides}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests must never reach Fintonic: respx mocks above the socket layer, so this only bites leaks."""
+
+    def refuse(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("Network access is disabled in tests; mock it with respx.")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse)
 
 
 @pytest.fixture

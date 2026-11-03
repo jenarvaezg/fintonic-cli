@@ -76,10 +76,11 @@ class FintonicClient:
         return self._request("POST", f"{base}/{path.lstrip('/')}", json=body)
 
     def _request(self, method: str, url: str, **kwargs: Any) -> Any:
-        if self._session.is_expired():
+        refreshed = self._session.is_expired()
+        if refreshed:
             self._refresh_session()
         response = self._send(method, url, **kwargs)
-        if response.status_code == 401 and self._relogin:
+        if response.status_code == 401 and self._relogin and not refreshed:
             self._refresh_session()
             response = self._send(method, url, **kwargs)
         raise_for_response(response)

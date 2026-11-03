@@ -6,6 +6,7 @@ Observed error envelope: `{"data": null, "error": {"errorCode": "401", "error": 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import httpx
 
@@ -30,6 +31,11 @@ class ApiError(FintonicError):
 
 class InputError(FintonicError, ValueError):
     """Invalid user input (unknown id, malformed split...)."""
+
+
+class CorruptStoreError(FintonicError):
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"El fichero de sesión {path} está corrupto. Bórralo y vuelve a ejecutar `fintonic login`.")
 
 
 class NetworkBlockedError(FintonicError):

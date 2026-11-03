@@ -9,12 +9,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 import typer
 from rich.console import Console
 
 from fintonic.auth import Authenticator, stored_pin_relogin
 from fintonic.client import PRODUCT_ENDPOINTS, FintonicClient
-from fintonic.errors import DeviceVerificationRequired, FintonicError, NotLoggedInError
+from fintonic.errors import DeviceVerificationRequired, FintonicError, InputError, NotLoggedInError
 from fintonic.http import build_http_client
 from fintonic.models import Category, Transaction, cents_to_decimal
 from fintonic.output import OutputFormat, format_eur, print_json, render
@@ -22,7 +23,8 @@ from fintonic.split import parse_part
 from fintonic.stores import SessionStore, StoreKind, resolve_store
 from fintonic.summary import month_range, summarize
 
-app = typer.Typer(no_args_is_help=True, help="CLI no oficial para Fintonic.")
+# Never render locals in tracebacks: frames hold the PIN and tokens.
+app = typer.Typer(no_args_is_help=True, help="CLI no oficial para Fintonic.", pretty_exceptions_show_locals=False)
 err = Console(stderr=True)
 
 FormatOpt = Annotated[OutputFormat, typer.Option("--format", "-f", help="Formato de salida.")]
@@ -77,16 +79,21 @@ def _client(store: SessionStore | None = None) -> FintonicClient:
 
 
 def _parse_date(value: str | None) -> date | None:
-    return datetime.strptime(value, "%Y-%m-%d").date() if value else None
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise InputError(f"Fecha inválida {value!r}: usa YYYY-MM-DD.") from exc
 
 
 def _read_pin(pin_stdin: bool) -> str:
-    if pin := os.environ.get("FINTONIC_PIN"):
-        return pin
-    if pin_stdin:
+    if pin_stdin:  # explicit flag wins over a possibly stale env var
         pin = sys.stdin.readline().strip()
         if not pin:
             raise typer.BadParameter("No se ha recibido el PIN por stdin.")
+        return pin
+    if pin := os.environ.get("FINTONIC_PIN"):
         return pin
     return typer.prompt("PIN", hide_input=True)
 
@@ -114,7 +121,9 @@ def login(
         auth = Authenticator(http)
         result = auth.login(email, pin, previous=previous)
         session = result.session
-        if remember:
+        if previous and previous.email != email:
+            store.delete_pin(previous.email)
+        if remember:  # the PIN was accepted; SMS only concerns the device
             store.save_pin(email, pin)
         if result.needs_device_verification:
             if result.device_changed:
@@ -294,12 +303,13 @@ def transactions(
     limit: Annotated[int | None, typer.Option("--limit", "-n", help="Máximo de movimientos (0 = todos).")] = 50,
 ) -> None:
     """Movimientos, del más reciente al más antiguo."""
+    begin, end = _parse_date(since), _parse_date(until)  # validate input before any network call
     with _client() as client:
         cats = client.categories()
         txs = list(
             client.transactions(
-                begin=_parse_date(since),
-                end=_parse_date(until),
+                begin=begin,
+                end=end,
                 category_id=category,
                 query=search,
                 bank_id=bank,
@@ -371,10 +381,11 @@ def summary(
     with _client() as client:
         cats = client.categories()
         excluded_keys = frozenset(k for pid in exclude_product or [] for k in client.product(pid).transaction_keys)
+        excluded_banks = frozenset(exclude_bank or [])
         txs = [
             t
             for t in client.transactions(begin=begin, end=end)
-            if t.bank_id not in set(exclude_bank or []) and t.product_id not in excluded_keys
+            if t.bank_id not in excluded_banks and t.product_id not in excluded_keys
         ]
     result = summarize(txs, cats, group_by_parent=group == "parent")
 
@@ -457,7 +468,8 @@ def tx_split(
     """Divide un movimiento en 2-3 categorías; las partes deben sumar el total."""
     parsed = [parse_part(p) for p in parts]
     with _client() as client:
-        unknown = [cid for cid, _ in parsed if cid not in client.categories()]
+        known = client.categories()
+        unknown = [cid for cid, _ in parsed if cid not in known]
         if unknown:
             raise typer.BadParameter(f"Categorías inexistentes: {', '.join(unknown)}")
         client.split(client.transaction(tx_id), parsed)
@@ -524,4 +536,7 @@ def main() -> None:
         app()
     except FintonicError as exc:
         err.print(f"[red]Error:[/red] {exc}")
+        raise SystemExit(1) from exc
+    except httpx.HTTPError as exc:
+        err.print(f"[red]Error de red:[/red] {type(exc).__name__}. Fintonic no responde; reintenta en un rato.")
         raise SystemExit(1) from exc
