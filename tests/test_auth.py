@@ -8,6 +8,7 @@ import respx
 
 from fintonic.auth import Authenticator, stored_pin_relogin
 from fintonic.errors import (
+    ApiError,
     AuthError,
     BlockedUserError,
     DeviceVerificationRequired,
@@ -21,11 +22,11 @@ from fintonic.stores import MemorySessionStore
 from tests.conftest import API, DEVICE, make_jwt
 
 
-def _token_response(device: str = DEVICE) -> httpx.Response:
+def _token_response(device: str = DEVICE, headers: dict[str, str] | None = None) -> httpx.Response:
     body = {
         "data": {
             "access_token": make_jwt(),
-            "refresh_token": make_jwt(),
+            "refresh_token": "refresh-123",
             "token_type": "Bearer",
             "expires_in": 1800,
             "error": None,
@@ -33,7 +34,7 @@ def _token_response(device: str = DEVICE) -> httpx.Response:
         },
         "error": None,
     }
-    return httpx.Response(200, json=body, headers={"device-uuid": device})
+    return httpx.Response(200, json=body, headers={"device-uuid": device, **(headers or {})})
 
 
 def test_first_login_requires_device_verification(mock_api: respx.MockRouter, http: httpx.Client) -> None:
@@ -196,3 +197,52 @@ def test_relogin_network_block_keeps_pin(mock_api: respx.MockRouter, http: httpx
     with pytest.raises(NetworkBlockedError):
         stored_pin_relogin(Authenticator(http), store)(session)
     assert store.load_pin(session.email) == "1234"
+
+
+def test_login_keeps_refresh_token_and_header_tokens(mock_api: respx.MockRouter, http: httpx.Client) -> None:
+    mock_api.post(f"{API}/oidc/token").mock(
+        return_value=_token_response(headers={"finia_token": "ft", "user-code": "uc"})
+    )
+    session = Authenticator(http).login("user@example.com", "1234").session
+    assert (session.refresh_token, session.finia_token, session.user_code) == ("refresh-123", "ft", "uc")
+
+
+def test_login_without_header_tokens_still_works(mock_api: respx.MockRouter, http: httpx.Client) -> None:
+    mock_api.post(f"{API}/oidc/token").mock(return_value=_token_response())
+    session = Authenticator(http).login("user@example.com", "1234").session
+    assert session.finia_token is None and session.user_code is None
+
+
+def test_device_calls_send_device_while_unverified(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session
+) -> None:
+    unverified = replace(session, device_verified=False, finia_token="ft", user_code="uc")
+    provision = mock_api.put(f"{API}/rest/device/provisions").mock(return_value=httpx.Response(202))
+    verify = mock_api.put(f"{API}/rest/device/verification").mock(return_value=httpx.Response(202))
+    auth = Authenticator(http)
+    auth.request_verification_code(unverified)
+    auth.verify_device(unverified, "1234")
+    for route in (provision, verify):
+        headers = route.calls.last.request.headers
+        assert headers["device-uuid"] == DEVICE
+        assert headers["finia_token"] == "ft"
+        assert headers["x-fintonic-user-code"] == "uc"
+
+
+def test_logout_invalidates_refresh_token(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    route = mock_api.post(f"{API}/oidc/logout").mock(return_value=httpx.Response(200, json={"data": None}))
+    Authenticator(http).logout(replace(session, refresh_token="rt"))
+    request = route.calls.last.request
+    assert json.loads(request.content) == {"refresh_token": "rt"}
+    assert request.headers["authorization"] == f"Bearer {session.access_token}"
+
+
+def test_logout_without_refresh_token_does_nothing(http: httpx.Client, session: Session) -> None:
+    Authenticator(http).logout(session)  # no route mocked: any request would fail
+
+
+def test_logout_is_not_retried(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    route = mock_api.post(f"{API}/oidc/logout").mock(return_value=httpx.Response(503))
+    with pytest.raises(ApiError):
+        Authenticator(http).logout(replace(session, refresh_token="rt"))
+    assert route.call_count == 1

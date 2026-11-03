@@ -1,9 +1,12 @@
 """Login flow: OIDC password grant proxied by finapi, plus SMS device verification.
 
 Observed sequence in the web app:
-  1. POST /oidc/token {username, password, deviceUUID}  -> tokens in body, `device-uuid` header
+  1. POST /oidc/token {username, password, deviceUUID}  -> tokens in body; `device-uuid`,
+     `user-code` and `finia_token` headers
   2. PUT  /rest/device/provisions {deviceUuid}          -> 202, sends SMS
   3. PUT  /rest/device/verification {deviceUuid, verificationCode} -> 202
+
+Logout (Android app, `TokensRetrofit.invalidateTokens`): POST /oidc/logout {refresh_token}.
 
 `username` is the account email (the web form labels it "Email de usuario").
 """
@@ -25,6 +28,7 @@ from fintonic.errors import (
     SessionExpiredError,
     raise_for_response,
 )
+from fintonic.headers import auth_headers
 from fintonic.session import Session
 from fintonic.stores import SessionStore
 
@@ -73,6 +77,9 @@ class Authenticator:
             access_token=access_token,
             device_uuid=device_uuid,
             device_verified=verified,
+            refresh_token=data.get("refresh_token"),
+            finia_token=response.headers.get("finia_token"),
+            user_code=response.headers.get("user-code"),
         )
         return LoginResult(
             session=session,
@@ -85,7 +92,7 @@ class Authenticator:
         response = self._http.put(
             f"{API_BASE}/rest/device/provisions",
             json={"deviceUuid": session.device_uuid},
-            headers=_auth_headers(session),
+            headers=auth_headers(session, force_device=True),
         )
         raise_for_response(response)
 
@@ -93,14 +100,21 @@ class Authenticator:
         response = self._http.put(
             f"{API_BASE}/rest/device/verification",
             json={"deviceUuid": session.device_uuid, "verificationCode": code.strip()},
-            headers=_auth_headers(session),
+            headers=auth_headers(session, force_device=True),
         )
         raise_for_response(response)
         return replace(session, device_verified=True)
 
-
-def _auth_headers(session: Session) -> dict[str, str]:
-    return {"authorization": f"Bearer {session.access_token}", "device-uuid": session.device_uuid or ""}
+    def logout(self, session: Session) -> None:
+        """Invalidate the session server-side. Not retried (POST); a no-op without refresh token."""
+        if not session.refresh_token:
+            return
+        response = self._http.post(
+            f"{API_BASE}/oidc/logout",
+            json={"refresh_token": session.refresh_token},
+            headers=auth_headers(session),
+        )
+        raise_for_response(response)
 
 
 def stored_pin_relogin(auth: Authenticator, store: SessionStore) -> Callable[[Session], Session]:
