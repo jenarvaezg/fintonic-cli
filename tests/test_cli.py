@@ -72,6 +72,25 @@ def test_login_with_sms(mock_api: respx.MockRouter, monkeypatch: pytest.MonkeyPa
     assert memory.load_pin("user@example.com") == "1234"
 
 
+def test_products_table_hides_canceled(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
+    body = {
+        "creditCards": {
+            "0182": [
+                {"id": "c1", "bankId": "0182", "balance": -5000, "alias": "Visa viva", "displayCardNumber": "**** 1"},
+                {"id": "c2", "bankId": "0182", "balance": 0, "alias": "Visa muerta", "canceled": True},
+            ]
+        }
+    }
+    mock_api.get(f"{API}/rest/creditcard/listCreditCards").mock(return_value=httpx.Response(200, json=body))
+
+    result = runner.invoke(cli.app, ["products", "credit_card", "-f", "csv"])
+
+    assert result.exit_code == 0, result.output
+    rows = list(csv.DictReader(io.StringIO(result.stdout)))
+    assert [r["nombre"] for r in rows] == ["Visa viva"]
+    assert rows[0]["saldo"] == "-5000"
+
+
 def test_logout_keeps_device(store: MemorySessionStore, session: Session) -> None:
     store.save_pin(session.email, "1234")
     assert runner.invoke(cli.app, ["logout"]).exit_code == 0

@@ -19,7 +19,7 @@ fintonic status
 
 fintonic position [--history]                  # saldos por tipo de producto
 fintonic banks                                 # bancos conectados y estado de sincronización
-fintonic products account|credit_card|deposit|fund|loan|share|pension_plan
+fintonic products [account|credit_card|loan|...] [--all]   # sin tipo = todos; --all incluye cancelados
 fintonic categories [--all]
 fintonic transactions --from 2026-10-01 --to 2026-10-31 -c G0898 -s mercadona -n 0 -f csv
 fintonic raw rest/user/profile                 # GET arbitrario (exploración)
@@ -59,7 +59,7 @@ Base `https://api.fintonic.com/finapi`, `Accept: application/vnd.fintonic-v7+jso
 | GET | `/rest/user/profile` | |
 | GET | `/rest/overview/position` | saldos actuales + histórico mensual |
 | GET | `/rest/bankRegistries` | bancos y tipos de producto |
-| GET | `/rest/{account,creditcard,deposit,fund,loan,share,pensionplan}/list*` | productos |
+| GET | `/rest/{account,creditcard,deposit,fund,loan,share,pensionplan}/list*` | `{"accounts": {bankId: [...]}}`, saldos en céntimos |
 | GET | `/rest/category/tree` | |
 | GET | `/rest/transaction/list` | `pageLimit`, `pageOffset`, `beginDate`, `endDate`, `categoryId`, `queryText`, `read` |
 | GET | `/rest/transaction/listByBank/{bankId}` | mismos filtros |

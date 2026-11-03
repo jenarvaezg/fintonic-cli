@@ -146,11 +146,30 @@ def banks(fmt: FormatOpt = OutputFormat.table) -> None:
 
 @app.command()
 def products(
-    kind: Annotated[str, typer.Argument(help=f"Uno de: {', '.join(PRODUCT_ENDPOINTS)}")] = "account",
+    kind: Annotated[str | None, typer.Argument(help=f"Uno de: {', '.join(PRODUCT_ENDPOINTS)}. Vacío = todos.")] = None,
+    fmt: FormatOpt = OutputFormat.table,
+    all_: Annotated[bool, typer.Option("--all", help="Incluir productos cancelados o inactivos.")] = False,
 ) -> None:
-    """Lista productos (cuentas, tarjetas, fondos...) en JSON crudo."""
+    """Cuentas, tarjetas, préstamos, fondos... con su saldo."""
     with _client() as client:
-        print_json(client.products(kind))
+        items = client.products(kind) if kind else client.all_products()
+    items = [p for p in items if all_ or p.is_live]
+    if fmt is OutputFormat.json:
+        print_json([p.model_dump(by_alias=True) for p in items])
+        return
+    table = fmt is OutputFormat.table
+    rows = [
+        {
+            "tipo": p.kind,
+            "banco": p.bank_id,
+            "nombre": p.name,
+            "número": p.masked_number,
+            "saldo": format_eur(p.balance) if table else p.balance,
+            **({} if p.is_live else {"estado": "cancelado"}),
+        }
+        for p in items
+    ]
+    render(rows, fmt, title="Productos")
 
 
 @app.command()

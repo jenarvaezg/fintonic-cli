@@ -11,7 +11,7 @@ import httpx
 from fintonic.config import API_BASE, BFF_BASE
 from fintonic.errors import NotLoggedInError, SessionExpiredError, raise_for_response
 from fintonic.http import build_http_client
-from fintonic.models import BankRegistry, Category, Position, Transaction, TransactionDateRange
+from fintonic.models import BankRegistry, Category, Position, Product, Transaction, TransactionDateRange
 from fintonic.session import Session, SessionStore
 
 PRODUCT_ENDPOINTS: Mapping[str, str] = {
@@ -105,12 +105,15 @@ class FintonicClient:
         """Open-banking sync status per bank (BFF)."""
         return self.get("openbanking/aggregations/", bff=True)
 
-    def products(self, kind: str) -> list[dict[str, Any]]:
+    def products(self, kind: str) -> list[Product]:
         try:
             endpoint = PRODUCT_ENDPOINTS[kind]
         except KeyError as exc:
             raise ValueError(f"Tipo de producto desconocido: {kind}. Opciones: {', '.join(PRODUCT_ENDPOINTS)}") from exc
-        return _unwrap_list(self.get(endpoint))
+        return [Product.model_validate({**raw, "kind": kind}) for raw in _flatten_by_bank(self.get(endpoint))]
+
+    def all_products(self) -> list[Product]:
+        return [p for kind in PRODUCT_ENDPOINTS for p in self.products(kind)]
 
     def position(self) -> Position:
         return Position.model_validate(self.get("rest/overview/position")["data"])
@@ -166,14 +169,15 @@ def _compact(params: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in params.items() if v is not None}
 
 
-def _unwrap_list(body: Any) -> list[dict[str, Any]]:
-    """Product endpoints wrap their lists inconsistently; find the list."""
-    if isinstance(body, list):
-        return body
-    if isinstance(body, dict):
-        if "data" in body:
-            return _unwrap_list(body["data"])
-        lists = [v for v in body.values() if isinstance(v, list)]
-        if len(lists) == 1:
-            return lists[0]
-    return []
+def _flatten_by_bank(body: Any) -> list[dict[str, Any]]:
+    """Product endpoints return `{"<kind>s": {"<bankId>": [product, ...]}}`."""
+    if not isinstance(body, dict):
+        return []
+    return [
+        product
+        for by_bank in body.values()
+        if isinstance(by_bank, dict)
+        for products in by_bank.values()
+        if isinstance(products, list)
+        for product in products
+    ]

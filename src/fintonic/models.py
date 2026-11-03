@@ -127,6 +127,37 @@ class BankRegistry(_ApiModel):
     products: list[ProductStatus] = Field(default_factory=list)
 
 
+class Product(_ApiModel):
+    """Account, card, loan, fund... All share this core; type-specific fields stay in `model_extra`."""
+
+    kind: str
+    id: str
+    bank_id: str
+    balance: int = 0
+    currency: str = "EURO"
+    active: bool = True
+    canceled: bool = False
+    alias: str | None = None
+    user_alias: str | None = None
+    web_alias: str | None = None
+    display_ccc: str | None = None
+    display_card_number: str | None = None
+    last_update: int | None = None
+
+    @property
+    def name(self) -> str:
+        return self.user_alias or self.alias or self.web_alias or ""
+
+    @property
+    def masked_number(self) -> str:
+        """Only the already-masked numbers the API provides for display."""
+        return self.display_ccc or self.display_card_number or ""
+
+    @property
+    def is_live(self) -> bool:
+        return self.active and not self.canceled
+
+
 class TransactionDateRange(_ApiModel):
     older_transaction_user_date: date | None = None
     newer_transaction_user_date: date | None = None

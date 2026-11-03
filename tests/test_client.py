@@ -161,13 +161,27 @@ def test_banks(mock_api: respx.MockRouter, http: httpx.Client, session: Session)
     assert banks[0].products[0].type == "ACCOUNT"
 
 
-@pytest.mark.parametrize(
-    "body",
-    [[{"id": 1}], {"data": [{"id": 1}]}, {"data": {"accounts": [{"id": 1}]}}, {"accounts": [{"id": 1}]}],
-)
-def test_products_unwrap_lists(mock_api: respx.MockRouter, http: httpx.Client, session: Session, body) -> None:
+def test_products_flatten_by_bank(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    body = {
+        "accounts": {
+            "0182": [{"id": "a1", "bankId": "0182", "balance": 12345, "alias": "Cuenta", "displayCcc": "ES** 1234"}],
+            "2091": [{"id": "a2", "bankId": "2091", "balance": 0, "active": False, "canceled": True}],
+        }
+    }
     mock_api.get(f"{API}/rest/account/listAccounts").mock(return_value=httpx.Response(200, json=body))
-    assert FintonicClient(session, http=http).products("account") == [{"id": 1}]
+
+    products = FintonicClient(session, http=http).products("account")
+
+    assert [p.id for p in products] == ["a1", "a2"]
+    assert products[0].kind == "account"
+    assert products[0].name == "Cuenta"
+    assert products[0].masked_number == "ES** 1234"
+    assert products[0].is_live and not products[1].is_live
+
+
+def test_products_empty_bank_map(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    mock_api.get(f"{API}/rest/fund/listFunds").mock(return_value=httpx.Response(200, json={"funds": {}}))
+    assert FintonicClient(session, http=http).products("fund") == []
 
 
 def test_unknown_product_kind(http: httpx.Client, session: Session) -> None:
