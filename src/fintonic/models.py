@@ -190,3 +190,20 @@ class Product(_ApiModel):
 class TransactionDateRange(_ApiModel):
     older_transaction_user_date: date | None = None
     newer_transaction_user_date: date | None = None
+
+
+class Mandate(_ApiModel):
+    """Direct-debit mandate (recibo domiciliado); schema from the Android app's DirectDebitMandateDto."""
+
+    mandate_id: str = ""
+    bank_id: str = ""
+    business_name: str = ""
+    category_id: str | None = None
+    status: str = ""
+
+
+class CategorySuggestion(_ApiModel):
+    """A category Fintonic's classifier proposes for a movement; `probability` is 0..1."""
+
+    id: str
+    probability: float = 0.0
