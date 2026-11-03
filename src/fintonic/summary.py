@@ -106,7 +106,7 @@ def _aggregate(
             (
                 CategoryTotal(
                     category_id=key,
-                    name=categories[key].name if key in categories else key,
+                    name=categories[key].label if key in categories else key,
                     kind=key[:1] if key[:1] in {"G", "I"} else "?",
                     amount=amount,
                     count=counts[key],

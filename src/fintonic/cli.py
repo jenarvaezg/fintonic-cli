@@ -395,7 +395,7 @@ def mandates(
         cats = client.categories() if items else {}
 
     def cat_name(cid: str | None) -> str | None:
-        return cats[cid].name if cid in cats else cid
+        return cats[cid].label if cid in cats else cid
 
     if fmt is OutputFormat.json:
         dumped = [
@@ -446,7 +446,7 @@ def _product_names(client: FintonicClient, txs: list[Transaction]) -> dict[str, 
 
 def _category_label(t: Transaction, cats: dict[str, Category]) -> str:
     cid = t.category_id
-    name = cats[cid].name if cid in cats else (cid or "")
+    name = cats[cid].label if cid in cats else (cid or "")
     return f"{name} +{len(t.category_amounts) - 1}" if t.is_split else name
 
 
@@ -521,7 +521,7 @@ def transactions(
                     "amount": t.amount,
                     "currency": t.currency,
                     "category_id": t.category_id,
-                    "category": cats[t.category_id].name if t.category_id in cats else None,
+                    "category": cats[t.category_id].label if t.category_id in cats else None,
                     "categories": {cid: str(cents_to_decimal(c)) for cid, c in t.category_amounts.items()},
                     "split": t.is_split,
                     "read": t.read,
@@ -708,7 +708,7 @@ def cashflow(
             category_id = category.upper()
             cats = client.categories()
             series = monthly_category_net(client, category_id, cats, pivot, months)
-            name = cats[category_id].name
+            name = cats[category_id].label
             rows = [{"mes": f"{m.start:%Y-%m}", "movs": m.count, "importe": money(m.net)} for m in series]
             render(rows, fmt, title=f"{name} ({category_id}) por mes")
             return
@@ -742,7 +742,7 @@ def _period(month: str | None, since: str | None, until: str | None) -> tuple[da
 
 def _cat_label(t: Transaction, cats: dict[str, Category]) -> str:
     cid = t.category_id or ""
-    return f"{cats[cid].name} ({cid})" if cid in cats else cid
+    return f"{cats[cid].label} ({cid})" if cid in cats else cid
 
 
 @app.command()
@@ -780,7 +780,7 @@ def transfers(
         if TRANSFER_CATEGORY not in cats:
             raise InputError(f"La categoría {TRANSFER_CATEGORY} no existe en tu árbol de categorías.")
         if not yes and not typer.confirm(
-            f"¿Recategorizar {len(targets)} movimientos como {TRANSFER_CATEGORY} ({cats[TRANSFER_CATEGORY].name})?"
+            f"¿Recategorizar {len(targets)} movimientos como {TRANSFER_CATEGORY} ({cats[TRANSFER_CATEGORY].label})?"
         ):
             err.print("Cancelado.")
             raise typer.Exit(1)
@@ -876,7 +876,7 @@ def tx_show(
         product = _product_names(client, [t]).get(t.product_id)
 
     def cat_name(cid: str) -> str:
-        return cats[cid].name if cid in cats else cid
+        return cats[cid].label if cid in cats else cid
 
     if fmt is OutputFormat.json:
         print_json(
@@ -927,7 +927,7 @@ def tx_suggest(
     rows = [
         {
             "id": s.id,
-            "categoría": cats[s.id].name if s.id in cats else "",
+            "categoría": cats[s.id].label if s.id in cats else "",
             "probabilidad": f"{s.probability:.0%}" if table else round(s.probability, 4),
         }
         for s in suggestions

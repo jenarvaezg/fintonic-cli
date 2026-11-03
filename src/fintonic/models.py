@@ -87,6 +87,11 @@ class Category(_ApiModel):
     computable: bool = True
 
     @property
+    def label(self) -> str:
+        """What the apps show: `shortname` ("Otros gastos"); on leaves `name` is a long description."""
+        return self.shortname or self.name or self.id
+
+    @property
     def parent_id(self) -> str:
         """Second-level group, e.g. G0898 (Restaurante) -> G0800 (Gastos varios)."""
         return self.ancestors[2] if len(self.ancestors) > 2 else self.id

@@ -89,3 +89,16 @@ def test_bff_nets_skip_empty_categories() -> None:
 def test_equal_amounts_sort_by_id() -> None:
     result = summarize([_tx(1, G0898=-100), _tx(2, G0897=-100)], CATS)
     assert [r.category_id for r in result.rows] == ["G0897", "G0898"]
+
+
+def test_category_label_prefers_shortname() -> None:
+    leaf = Category(id="G0898", name="Que tengas del día a día.", shortname="Otros gastos")
+    assert leaf.label == "Otros gastos"
+    assert Category(id="G0800", name="Gastos varios").label == "Gastos varios"
+    assert Category(id="G0001").label == "G0001"
+
+
+def test_summary_rows_use_short_labels() -> None:
+    cats = {"G0898": Category(id="G0898", name="Que tengas del día a día.", shortname="Otros gastos")}
+    result = summarize([_tx(1, G0898=-700)], cats)
+    assert result.rows[0].name == "Otros gastos"
