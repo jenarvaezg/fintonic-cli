@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import date
 from typing import Any, Self
 
 import httpx
 
+from fintonic.aggregation import AggregationStatus, evaluate
 from fintonic.config import API_BASE, BFF_BASE
-from fintonic.errors import NotLoggedInError, SessionExpiredError, raise_for_response
+from fintonic.errors import InputError, NotLoggedInError, SessionExpiredError, raise_for_response
 from fintonic.http import build_http_client
 from fintonic.models import BankRegistry, Category, Position, Product, Transaction, TransactionDateRange
 from fintonic.session import Session
+from fintonic.split import build_split_body
 from fintonic.stores import SessionStore
 
 PRODUCT_ENDPOINTS: Mapping[str, str] = {
@@ -63,9 +66,14 @@ class FintonicClient:
 
     # ---- transport ---------------------------------------------------------
 
-    def get(self, path: str, params: Mapping[str, Any] | None = None, *, bff: bool = False) -> Any:
+    def get(self, path: str, params: Any = None, *, bff: bool = False) -> Any:
         base = BFF_BASE if bff else API_BASE
         return self._request("GET", f"{base}/{path.lstrip('/')}", params=params)
+
+    def post(self, path: str, body: Any = None, *, bff: bool = False) -> Any:
+        """Not retried by the transport: writes must not be replayed blindly."""
+        base = BFF_BASE if bff else API_BASE
+        return self._request("POST", f"{base}/{path.lstrip('/')}", json=body)
 
     def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         if self._session.is_expired():
@@ -106,11 +114,26 @@ class FintonicClient:
         """Open-banking sync status per bank (BFF)."""
         return self.get("openbanking/aggregations/", bff=True)
 
+    def refresh_banks(self) -> None:
+        """Ask every connected bank to sync, like Perfil > Entidades > Actualizar."""
+        self.post("openbanking/aggregations/data-actualizations", bff=True)
+
+    def wait_for_banks(
+        self, *, timeout: float = 300, interval: float = 2, sleep: Callable[[float], None] = time.sleep
+    ) -> AggregationStatus:
+        """Poll until no bank is syncing (banks waiting for 2FA are reported, not awaited)."""
+        deadline = time.monotonic() + timeout
+        while True:
+            status = evaluate(self.aggregations())
+            if status.done or time.monotonic() >= deadline:
+                return status
+            sleep(interval)
+
     def products(self, kind: str) -> list[Product]:
         try:
             endpoint = PRODUCT_ENDPOINTS[kind]
         except KeyError as exc:
-            raise ValueError(f"Tipo de producto desconocido: {kind}. Opciones: {', '.join(PRODUCT_ENDPOINTS)}") from exc
+            raise InputError(f"Tipo de producto desconocido: {kind}. Opciones: {', '.join(PRODUCT_ENDPOINTS)}") from exc
         return [Product.model_validate({**raw, "kind": kind}) for raw in _flatten_by_bank(self.get(endpoint))]
 
     def all_products(self, kinds: Iterable[str] = PRODUCT_ENDPOINTS) -> list[Product]:
@@ -121,7 +144,7 @@ class FintonicClient:
         for p in self.all_products():
             if p.id == product_id:
                 return p
-        raise ValueError(f"No existe el producto {product_id}. Mira los ids con `fintonic products --all`.")
+        raise InputError(f"No existe el producto {product_id}. Mira los ids con `fintonic products --all`.")
 
     def position(self) -> Position:
         return Position.model_validate(self.get("rest/overview/position")["data"])
@@ -133,6 +156,34 @@ class FintonicClient:
         return {cid: Category.model_validate(raw) for cid, raw in tree.items()}
 
     # ---- transactions ------------------------------------------------------
+
+    def transaction(self, tx_id: str) -> Transaction:
+        body = self.get("rest/transaction/listByIds", [("transactionIds", tx_id)])
+        for raw in body.get("resultList") or []:
+            if raw.get("id") == tx_id:
+                return Transaction.model_validate(raw)
+        raise InputError(f"No existe el movimiento {tx_id}.")
+
+    def set_category(self, tx_id: str, category_id: str, *, apply_to_similar: bool = False) -> None:
+        """Recategorize one movement; `apply_to_similar` creates a rule (web: "aplicar a todos")."""
+        action = "applyUserRule" if apply_to_similar else "category"
+        self.post(f"rest/transaction/{tx_id}/{action}", {"categoryId": category_id})
+
+    def set_description(self, tx_id: str, text: str) -> None:
+        self.post(f"rest/transaction/{tx_id}/primaryDisplay", {"textFieldValue": text})
+
+    def set_note(self, tx_id: str, text: str) -> None:
+        self.post(f"rest/transaction/{tx_id}/secondaryDisplay", {"textFieldValue": text})
+
+    def split(self, tx: Transaction, parts: list[tuple[str, int]]) -> None:
+        """Split `tx` into (category_id, positive cents) parts that must add up to its amount."""
+        self.post(f"rest/transaction/{tx.id}/split", build_split_body(tx.quantity, parts))
+
+    def mark_read(self, tx_id: str) -> None:
+        self.post(f"rest/transaction/{tx_id}/markAsRead")
+
+    def mark_all_read(self, bank_id: str | None = None) -> None:
+        self.post(f"rest/transaction/markAsReadByBank/{bank_id}" if bank_id else "rest/transaction/markAsReadByUser")
 
     def transaction_date_range(self) -> TransactionDateRange:
         return TransactionDateRange.model_validate(self.get("rest/transaction/olderNewerTransactionUserDate"))

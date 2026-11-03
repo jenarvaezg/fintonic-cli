@@ -18,6 +18,7 @@ from fintonic.errors import DeviceVerificationRequired, FintonicError, NotLogged
 from fintonic.http import build_http_client
 from fintonic.models import Category, Transaction, cents_to_decimal
 from fintonic.output import OutputFormat, format_eur, print_json, render
+from fintonic.split import parse_part
 from fintonic.stores import SessionStore, StoreKind, resolve_store
 from fintonic.summary import month_range, summarize
 
@@ -424,6 +425,98 @@ def raw(
     params = dict(p.split("=", 1) for p in param or [])
     with _client() as client:
         print_json(client.get(path, params, bff=bff))
+
+
+tx_app = typer.Typer(no_args_is_help=True, help="Editar movimientos (escribe en tu cuenta de Fintonic).")
+app.add_typer(tx_app, name="tx")
+
+
+@tx_app.command("set-category")
+def tx_set_category(
+    tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
+    category_id: Annotated[str, typer.Argument(help="Categoría destino (ver `fintonic categories`).")],
+    similar: Annotated[
+        bool, typer.Option("--similar", help="Aplicar también a movimientos similares (crea regla).")
+    ] = False,
+) -> None:
+    """Recategoriza un movimiento."""
+    with _client() as client:
+        if category_id.upper() not in client.categories():
+            raise typer.BadParameter(f"La categoría {category_id} no existe.")
+        client.set_category(tx_id, category_id.upper(), apply_to_similar=similar)
+    err.print(f"[green]Movimiento {tx_id} → {category_id.upper()}[/green]")
+
+
+@tx_app.command("split")
+def tx_split(
+    tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
+    parts: Annotated[
+        list[str], typer.Argument(help="CATEGORIA:IMPORTE en euros positivos, p.ej. G0898:85 G0101:19,50")
+    ],
+) -> None:
+    """Divide un movimiento en 2-3 categorías; las partes deben sumar el total."""
+    parsed = [parse_part(p) for p in parts]
+    with _client() as client:
+        unknown = [cid for cid, _ in parsed if cid not in client.categories()]
+        if unknown:
+            raise typer.BadParameter(f"Categorías inexistentes: {', '.join(unknown)}")
+        client.split(client.transaction(tx_id), parsed)
+    err.print(f"[green]Movimiento {tx_id} dividido en {len(parsed)} partes.[/green]")
+
+
+@tx_app.command("describe")
+def tx_describe(tx_id: str, text: str) -> None:
+    """Cambia el concepto que se muestra."""
+    with _client() as client:
+        client.set_description(tx_id, text)
+
+
+@tx_app.command("note")
+def tx_note(tx_id: str, text: str) -> None:
+    """Añade o cambia la nota del movimiento."""
+    with _client() as client:
+        client.set_note(tx_id, text)
+
+
+@tx_app.command("mark-read")
+def tx_mark_read(
+    tx_ids: Annotated[list[str] | None, typer.Argument(help="ids a marcar como leídos.")] = None,
+    all_: Annotated[bool, typer.Option("--all", help="Marcar todos (o los de --bank).")] = False,
+    bank: Annotated[str | None, typer.Option("--bank", help="Con --all, solo este banco.")] = None,
+) -> None:
+    """Marca movimientos como leídos."""
+    if not tx_ids and not all_:
+        raise typer.BadParameter("Indica ids o usa --all.")
+    with _client() as client:
+        if all_:
+            client.mark_all_read(bank)
+        for tx_id in tx_ids or []:
+            client.mark_read(tx_id)
+    err.print("[green]Hecho.[/green]")
+
+
+@app.command()
+def refresh(
+    wait: Annotated[bool, typer.Option(help="Esperar a que terminen de sincronizar.")] = True,
+    timeout: Annotated[int, typer.Option(help="Segundos máximos de espera.")] = 300,
+) -> None:
+    """Pide a todos los bancos que sincronicen (Perfil > Entidades > Actualizar)."""
+    with _client() as client:
+        client.refresh_banks()
+        if not wait:
+            err.print("Actualización solicitada.")
+            return
+        with err.status("Sincronizando bancos…"):
+            status = client.wait_for_banks(timeout=timeout)
+    if status.needs_2fa:
+        err.print(f"[yellow]Requieren aprobar 2FA en la app del banco: {', '.join(status.needs_2fa)}[/yellow]")
+    if status.errors:
+        err.print(f"[red]Con error: {', '.join(status.errors)}[/red]")
+    if status.in_progress:
+        err.print(f"[yellow]Siguen sincronizando tras {timeout}s: {', '.join(status.in_progress)}[/yellow]")
+        raise typer.Exit(2)
+    if not status.errors:
+        err.print("[green]Bancos actualizados.[/green]")
 
 
 def main() -> None:

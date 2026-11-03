@@ -24,6 +24,15 @@ fintonic categories [--all]
 fintonic transactions --from 2026-10-01 --to 2026-10-31 -c G0898 -s mercadona -n 0 -f csv
 fintonic transactions --product <id> --unread  # id de `fintonic products`
 fintonic summary --month 2026-10 [--group parent] [--exclude-bank 2091] [--exclude-product <id>]
+fintonic refresh [--no-wait] [--timeout 300]  # sincronizar bancos y esperar (avisa de 2FA pendiente)
+
+# Escritura (modifica tu cuenta)
+fintonic tx set-category <id> G0898 [--similar]  # --similar crea regla para movimientos parecidos
+fintonic tx split <id> G0898:85 G0101:195       # 2-3 partes en euros positivos; deben sumar el total
+fintonic tx describe <id> "Cena cumple"
+fintonic tx note <id> "pagó Ana la mitad"
+fintonic tx mark-read <id>... | --all [--bank 0182]
+
 fintonic raw rest/user/profile                 # GET arbitrario (exploración)
 fintonic raw user-insights --bff
 fintonic logout [--forget-device]
@@ -77,6 +86,19 @@ Base `https://api.fintonic.com/finapi`, `Accept: application/vnd.fintonic-v7+jso
 | GET | `/rest/transaction/list` | `pageLimit`, `pageOffset`, `beginDate`, `endDate`, `categoryId`, `queryText`, `read` |
 | GET | `/rest/transaction/listByBank/{bankId}` | mismos filtros |
 | GET | `/rest/transaction/olderNewerTransactionUserDate` | rango de fechas disponible |
+
+Escritura (todas `POST`, nunca se reintentan):
+
+| Ruta | Body |
+|---|---|
+| `/rest/transaction/{id}/category` | `{categoryId}` |
+| `/rest/transaction/{id}/applyUserRule` | `{categoryId}` — recategoriza y crea regla |
+| `/rest/transaction/{id}/split` | `{categoryIds: [...], categoryAmounts: [...]}` céntimos con el signo del movimiento |
+| `/rest/transaction/{id}/primaryDisplay` · `secondaryDisplay` | `{textFieldValue}` (concepto · nota) |
+| `/rest/transaction/{id}/markAsRead` · `markAsReadByBank/{bankId}` · `markAsReadByUser` | — |
+| BFF `/openbanking/aggregations/data-actualizations` | — refresca bancos; luego sondear `GET /openbanking/aggregations/` hasta que no haya `IN_PROGRESS` |
+
+Otros GET útiles: `/rest/transaction/listByIds?transactionIds=…`, `/rest/stats/getAllByRange?beginDate&endDate` (ingresos/gastos por categoría calculados por Fintonic; `summary` coincide al céntimo), `/rest/category/probability?transactionId=…`.
 
 BFF `https://fintonic-pfm-bff.fintonic.com`: `user-insights`, `score/history`, `insurances`, `openbanking/aggregations/`.
 

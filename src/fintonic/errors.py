@@ -28,6 +28,10 @@ class ApiError(FintonicError):
         super().__init__(f"HTTP {status} en {path or '?'}: {message}")
 
 
+class InputError(FintonicError, ValueError):
+    """Invalid user input (unknown id, malformed split...)."""
+
+
 class NetworkBlockedError(FintonicError):
     def __init__(self, status: int) -> None:
         self.status = status

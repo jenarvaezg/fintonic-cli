@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
 
+from fintonic.errors import InputError
 from fintonic.models import Category, Transaction
 
 
@@ -49,7 +50,7 @@ def month_range(month: str) -> tuple[date, date]:
         year, mon = (int(part) for part in month.split("-"))
         return date(year, mon, 1), date(year, mon, monthrange(year, mon)[1])
     except ValueError as exc:
-        raise ValueError(f"Mes inválido: {month!r}. Usa el formato YYYY-MM.") from exc
+        raise InputError(f"Mes inválido: {month!r}. Usa el formato YYYY-MM.") from exc
 
 
 def _is_computable(category_id: str, categories: Mapping[str, Category]) -> bool:
