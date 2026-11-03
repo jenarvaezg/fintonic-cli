@@ -429,19 +429,50 @@ def categories(fmt: FormatOpt = OutputFormat.table, all_: Annotated[bool, typer.
     """Árbol de categorías (por defecto solo las clasificables)."""
     with _client() as client:
         cats = client.categories()
+    shown = [c for c in sorted(cats.values(), key=lambda c: c.id) if all_ or c.classified]
+    if fmt is OutputFormat.json:
+        print_json(
+            [
+                {
+                    "id": c.id,
+                    "emoji": c.emoji,
+                    "name": c.label,
+                    "description": c.name if c.name != c.label else None,
+                    "parent_id": c.ancestors[-1] if c.ancestors else None,
+                    "classified": c.classified,
+                    "computable": c.computable,
+                }
+                for c in shown
+            ]
+        )
+        return
     rows = [
-        {"id": c.id, "emoji": c.emoji or "", "nombre": c.name, "padre": c.ancestors[-1] if c.ancestors else ""}
-        for c in sorted(cats.values(), key=lambda c: c.id)
-        if all_ or c.classified
+        {"id": c.id, "emoji": c.emoji or "", "nombre": c.label, "padre": c.ancestors[-1] if c.ancestors else ""}
+        for c in shown
     ]
     render(rows, fmt, title="Categorías")
 
 
-def _product_names(client: FintonicClient, txs: list[Transaction]) -> dict[str, str]:
-    """Map transaction product_id -> product name, fetching only the product kinds present."""
+def _tx_products(client: FintonicClient, txs: list[Transaction]) -> dict[str, Product]:
+    """Map transaction product_id (ccc or card number) -> product, fetching only the product kinds present."""
     kinds = {"ACCOUNT": "account", "CREDITCARD": "credit_card"}
     needed = {kinds[t.type] for t in txs if t.type in kinds}
-    return {key: p.name for p in client.all_products(sorted(needed)) for key in p.transaction_keys}
+    return {key: p for p in client.all_products(sorted(needed)) for key in p.transaction_keys}
+
+
+def _product_fields(t: Transaction, products: dict[str, Product]) -> dict[str, str | None]:
+    """JSON fields naming the movement's product: `product_ref` is its id in `fintonic products` (and `--product`)."""
+    product = products.get(t.product_id)
+    return {
+        "product_id": t.product_id,
+        "product_ref": product.id if product else None,
+        "product": product.name if product else None,
+    }
+
+
+def _product_name(products: dict[str, Product], t: Transaction) -> str:
+    product = products.get(t.product_id)
+    return (product.name if product else "") or t.bank_id
 
 
 def _category_label(t: Transaction, cats: dict[str, Category]) -> str:
@@ -507,7 +538,7 @@ def transactions(
                 limit=limit or None,
             )
         )
-        products = _product_names(client, txs)
+        products = _tx_products(client, txs)
 
     if fmt is OutputFormat.json:
         print_json(
@@ -526,8 +557,7 @@ def transactions(
                     "split": t.is_split,
                     "read": t.read,
                     "bank_id": t.bank_id,
-                    "product_id": t.product_id,
-                    "product": products.get(t.product_id),
+                    **_product_fields(t, products),
                 }
                 for t in txs
             ]
@@ -542,7 +572,7 @@ def transactions(
             "concepto": t.label,
             "categoría": _category_label(t, cats),
             "importe": format_eur(t.quantity) if table else t.amount,
-            "producto": products.get(t.product_id) or t.bank_id,
+            "producto": _product_name(products, t),
             "leído": ("" if t.read else "●") if table else t.read,
             "id": t.id,
         }
@@ -756,6 +786,10 @@ def transfers(
         bool, typer.Option("--apply", help=f"Recategorizar como {TRANSFER_CATEGORY} (escribe en tu cuenta).")
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="No pedir confirmación con --apply.")] = False,
+    max_changes: Annotated[
+        int,
+        typer.Option("--max-changes", min=1, help="Con --yes, no aplicar si hay más movimientos que recategorizar."),
+    ] = 10,
 ) -> None:
     """Detecta traspasos entre tus productos que no están en una categoría no computable (N*).
 
@@ -772,13 +806,18 @@ def transfers(
             for p in find_transfers(txs, days=days)
             if begin <= tx_date(p.debit) <= end or begin <= tx_date(p.credit) <= end
         ]
-        products = _product_names(client, [t for p in pairs for t in (p.debit, p.credit)])
+        products = _tx_products(client, [t for p in pairs for t in (p.debit, p.credit)])
         _render_transfers(pairs, cats, products, fmt)
         targets = [t for p in pairs for t in p.to_recategorize]
         if not apply or not targets:
             return
         if TRANSFER_CATEGORY not in cats:
             raise InputError(f"La categoría {TRANSFER_CATEGORY} no existe en tu árbol de categorías.")
+        if yes and len(targets) > max_changes:
+            raise InputError(
+                f"Hay {len(targets)} movimientos que recategorizar y --yes solo aplica hasta {max_changes} sin "
+                "preguntar. Revisa la lista y confirma sin --yes, o sube --max-changes."
+            )
         if not yes and not typer.confirm(
             f"¿Recategorizar {len(targets)} movimientos como {TRANSFER_CATEGORY} ({cats[TRANSFER_CATEGORY].label})?"
         ):
@@ -798,7 +837,7 @@ def transfers(
 
 
 def _render_transfers(
-    pairs: list[TransferPair], cats: dict[str, Category], products: dict[str, str], fmt: OutputFormat
+    pairs: list[TransferPair], cats: dict[str, Category], products: dict[str, Product], fmt: OutputFormat
 ) -> None:
     if fmt is OutputFormat.json:
         print_json(
@@ -813,8 +852,7 @@ def _render_transfers(
                             "date": tx_date(t),
                             "concept": t.label,
                             "category_id": t.category_id,
-                            "product_id": t.product_id,
-                            "product": products.get(t.product_id),
+                            **_product_fields(t, products),
                         }
                         for side, t in (("debit", p.debit), ("credit", p.credit))
                     },
@@ -833,11 +871,11 @@ def _render_transfers(
         {
             "importe": format_eur(p.amount) if table else cents_to_decimal(p.amount),
             "fecha cargo": tx_date(p.debit),
-            "origen": products.get(p.debit.product_id) or p.debit.bank_id,
+            "origen": _product_name(products, p.debit),
             "concepto cargo": p.debit.label,
             "categoría cargo": side(p.debit),
             "fecha abono": tx_date(p.credit),
-            "destino": products.get(p.credit.product_id) or p.credit.bank_id,
+            "destino": _product_name(products, p.credit),
             "concepto abono": p.credit.label,
             "categoría abono": side(p.credit),
             "id cargo": p.debit.id,
@@ -873,7 +911,7 @@ def tx_show(
     with _client() as client:
         t = client.transaction(tx_id)
         cats = client.categories()
-        product = _product_names(client, [t]).get(t.product_id)
+        products = _tx_products(client, [t])
 
     def cat_name(cid: str) -> str:
         return cats[cid].label if cid in cats else cid
@@ -883,7 +921,7 @@ def tx_show(
             {
                 **t.model_dump(by_alias=True, mode="json"),
                 "amount": t.amount,
-                "product": product,
+                **{k: v for k, v in _product_fields(t, products).items() if k != "product_id"},
                 "category": cat_name(t.category_id) if t.category_id else None,
                 "parts": [
                     {"category_id": cid, "category": cat_name(cid), "amount": cents_to_decimal(c)}
@@ -906,7 +944,9 @@ def tx_show(
         "fecha operación": t.operation_date,
         "categoría": f"{cat_name(t.category_id)} ({t.category_id})" if t.category_id else "",
         "dividido": f"sí: {parts}" if t.is_split else "no",
-        "producto": product or t.product_id,
+        "producto": f"{products[t.product_id].name} ({products[t.product_id].id})"
+        if t.product_id in products
+        else t.product_id,
         "banco": t.bank_id,
         "tipo": t.type,
         "leído": "sí" if t.read else "no",
@@ -993,7 +1033,11 @@ def tx_set_category(
     tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
     category_id: Annotated[str, typer.Argument(help="Categoría destino (ver `fintonic categories`).")],
     similar: Annotated[
-        bool, typer.Option("--similar", help="Aplicar también a movimientos similares (crea regla).")
+        bool,
+        typer.Option(
+            "--similar",
+            help="Aplicar también a movimientos similares (crea una regla que `tx undo` no puede deshacer).",
+        ),
     ] = False,
     dry_run: DryRunOpt = False,
 ) -> None:
@@ -1169,7 +1213,11 @@ def tx_undo(
     tx_id: Annotated[str, typer.Argument(help="id del movimiento.")],
     dry_run: DryRunOpt = False,
 ) -> None:
-    """Deshace el último cambio registrado de un movimiento (también se registra)."""
+    """Deshace el último cambio registrado de un movimiento (también se registra).
+
+    No deshace `set-category --similar`: creó una regla en Fintonic que afecta a otros movimientos
+    y este comando no la toca; se niega y no escribe nada. Revisa la regla en la app.
+    """
     record = _changelog().last_for(tx_id)
     if record is None:
         raise no_history(tx_id)
@@ -1196,8 +1244,14 @@ def refresh(
         typer.Option("--2fa/--no-2fa", help="Si un banco pide 2FA, pedir aquí el código (solo en terminal)."),
     ] = True,
 ) -> None:
-    """Pide a los bancos que sincronicen (Perfil > Entidades > Actualizar) y espera."""
+    """Pide a los bancos que sincronicen (Perfil > Entidades > Actualizar) y espera.
+
+    Un banco cuenta como actualizado si se le ve sincronizar o si cambia su fecha de última
+    sincronización. Sale con 2 si alguno sigue sincronizando al agotar --timeout, y con 3 si
+    alguno acaba con error, con 2FA pendiente o rechazado, o sin constancia de haber sincronizado.
+    """
     with _client() as client:
+        since = client.last_sync_dates() if wait else None
         if bank:
             client.refresh_bank(bank)
         else:
@@ -1211,6 +1265,7 @@ def refresh(
             timeout=timeout,
             bank_ids=[bank] if bank else None,
             interactive=ask_2fa and _stdin_is_tty(),
+            since=since,
         )
 
 
@@ -1224,7 +1279,10 @@ def bank_2fa(
     wait: Annotated[bool, typer.Option(help="Esperar a que termine de sincronizar.")] = True,
     timeout: Annotated[int, typer.Option(help="Segundos máximos de espera.")] = 300,
 ) -> None:
-    """Envía el código 2FA que pide un banco al sincronizar."""
+    """Envía el código 2FA que pide un banco al sincronizar.
+
+    Al esperar, sale con 2 si sigue sincronizando al agotar --timeout y con 3 si acaba con error o 2FA pendiente.
+    """
     with _client() as client:
         aggregation = client.aggregation(bank_id)
         if not (needs_2fa(aggregation) or is_invalid_2fa(aggregation)):

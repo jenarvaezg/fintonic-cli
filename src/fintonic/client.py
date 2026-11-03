@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+from dataclasses import replace
 from datetime import date
 from itertools import islice
 from typing import Any, Self
@@ -18,6 +19,7 @@ from fintonic.aggregation import (
     evaluate,
     find_aggregation,
     is_invalid_2fa,
+    is_syncing,
     needs_2fa,
     second_factor_body,
 )
@@ -68,6 +70,7 @@ PRODUCT_PATHS: Mapping[str, str] = {kind: endpoint.split("/")[1] for kind, endpo
 
 DEFAULT_PAGE_SIZE = 100  # the server caps `size` at 100
 MAX_2FA_ATTEMPTS = 3
+SYNC_START_GRACE = 20.0  # seconds a just-refreshed bank may take to leave its previous final state
 
 Relogin = Callable[[Session], Session]
 # Returns the code, "" to confirm a push approval, or None to leave that bank waiting.
@@ -179,26 +182,40 @@ class FintonicClient:
         """Answer the bank's 2FA: a code, or None/"" to confirm an approval made in the bank app."""
         self.put(f"openbanking/aggregations/{aggregation_id}/2fa", second_factor_body(otp), bff=True)
 
+    def last_sync_dates(self) -> dict[str, int | None]:
+        """Each bank's `lastUpdateDate` (epoch ms), to tell later whether a refresh really synced it."""
+        return {b.bank_id: b.last_update_date for b in self.banks()}
+
     def wait_for_banks(
         self,
         *,
         timeout: float = 300,
         interval: float = 2,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
         bank_ids: Collection[str] | None = None,
         on_2fa: SecondFactorHandler | None = None,
         answered: Mapping[str, Any] | None = None,
+        since: Mapping[str, int | None] | None = None,
+        grace: float = SYNC_START_GRACE,
     ) -> AggregationStatus:
         """Poll until no bank (of `bank_ids`, default all) is syncing.
 
         Banks waiting for 2FA are reported, not awaited, unless `on_2fa` answers them: the
         answer is sent and the bank counts as syncing until its status changes. `answered`
         maps banks already answered elsewhere to the status they had at that moment.
+
+        Right after a refresh a bank may still show its previous, final state. With `since`
+        (`last_sync_dates()` taken before the refresh) a bank only counts as synced once it
+        was seen syncing or its `lastUpdateDate` moved; until then it is awaited for up to
+        `grace` seconds and afterwards reported as `unconfirmed`. Banks missing from `since`
+        have no date to compare and are accepted as before.
         """
-        deadline = time.monotonic() + timeout
+        start = clock()
         answered_at: dict[str, Any] = dict(answered or {})  # bank id -> status when answered
         attempts: Counter[str] = Counter()
         skipped: set[str] = set()
+        confirmed: set[str] = set()
         while True:
             aggs = [a for a in self.aggregations() if bank_ids is None or entity_id(a) in bank_ids]
             awaiting = {
@@ -224,9 +241,42 @@ class FintonicClient:
                 attempts[bank] += 1
                 awaiting.add(bank)
             status = evaluate(aggs, awaiting=awaiting)
-            if status.done or time.monotonic() >= deadline:
+            elapsed = clock() - start
+            unsure = False  # some bank shows a final state that may predate the refresh
+            if since is not None:
+                status, unsure = self._confirm_synced(status, aggs, since, confirmed, check_dates=elapsed < grace)
+            settled = status.done and not (unsure and elapsed < grace)
+            if settled or elapsed >= timeout:
                 return status
             sleep(interval)
+
+    def _confirm_synced(
+        self,
+        status: AggregationStatus,
+        aggs: Sequence[dict[str, Any]],
+        since: Mapping[str, int | None],
+        confirmed: set[str],
+        *,
+        check_dates: bool,
+    ) -> tuple[AggregationStatus, bool]:
+        """Find banks in a final state never seen syncing (`confirmed` accumulates across polls).
+
+        Returns the status with those that ended without error as `unconfirmed`, and whether any
+        bank (with or without error) is still unconfirmed.
+        """
+        confirmed.update(status.in_progress, status.needs_2fa)
+        # a rejected 2FA counts only while the sync is still running; once final it may be the previous one's
+        confirmed.update(entity_id(a) for a in aggs if is_invalid_2fa(a) and is_syncing(a))
+        pending = [bank for a in aggs if (bank := entity_id(a)) not in confirmed and bank in since]
+        if pending and check_dates:  # past the grace period the answer no longer changes the wait
+            confirmed.update(
+                bank
+                for bank, updated in self.last_sync_dates().items()
+                if bank in pending and (updated or 0) > (since.get(bank) or 0)
+            )
+        unsure = [bank for bank in pending if bank not in confirmed]
+        unconfirmed = tuple(bank for bank in unsure if bank not in status.errors + status.invalid_2fa)
+        return replace(status, unconfirmed=unconfirmed), bool(unsure)
 
     def products(self, kind: str) -> list[Product]:
         try:

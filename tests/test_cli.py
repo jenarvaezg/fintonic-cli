@@ -50,9 +50,38 @@ def test_transactions_json(mock_api: respx.MockRouter, store: MemorySessionStore
     assert first["amount"] == "-10.50"
     assert first["category"] == "Restaurante"
     assert first["product"] == "Nómina"
+    assert first["product_ref"] == "acc1"  # the id `fintonic products` shows, unlike product_id (the ccc)
+    assert first["product_id"] == "p" * 64
     assert first["operation_date"] == "2026-10-29"
     assert second["split"] is True
     assert second["categories"] == {"G0898": "-7.00", "G0101": "-3.00"}
+
+
+def test_categories_use_short_names(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
+    tree = {
+        "categoryTree": {
+            "G0899": {
+                "id": "G0899",
+                "name": "Gastos que no encajan en otra categoría",
+                "shortname": "Otros gastos",
+                "classified": True,
+                "ancestors": ["G", "G0000", "G0800"],
+            }
+        }
+    }
+    mock_api.get(f"{API}/rest/category/tree").mock(return_value=httpx.Response(200, json=tree))
+
+    as_json = runner.invoke(cli.app, ["categories", "-f", "json"])
+    as_csv = runner.invoke(cli.app, ["categories", "-f", "csv"])
+
+    assert as_json.exit_code == 0, as_json.output
+    (cat,) = json.loads(as_json.stdout)
+    assert (cat["name"], cat["description"], cat["parent_id"]) == (
+        "Otros gastos",
+        "Gastos que no encajan en otra categoría",
+        "G0800",
+    )
+    assert next(csv.DictReader(io.StringIO(as_csv.stdout)))["nombre"] == "Otros gastos"
 
 
 def test_transactions_table_marks_splits(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:

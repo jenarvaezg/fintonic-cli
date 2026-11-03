@@ -59,6 +59,10 @@ def entity_id(aggregation: dict[str, Any]) -> str:
     return str(aggregation.get("entityId"))
 
 
+def is_syncing(aggregation: dict[str, Any]) -> bool:
+    return _upper(_status(aggregation).get("general")) == "IN_PROGRESS"
+
+
 def is_invalid_2fa(aggregation: dict[str, Any]) -> bool:
     status = _status(aggregation)
     return _upper(status.get("detail")) == "INVALID_2FA" or _upper(status.get("reason")) in INVALID_2FA_REASONS
@@ -76,6 +80,12 @@ class AggregationStatus:
     needs_2fa: tuple[str, ...]  # waiting for the user's code or approval in the bank app
     errors: tuple[str, ...]
     invalid_2fa: tuple[str, ...] = ()  # last 2FA answer rejected, expired or cancelled
+    unconfirmed: tuple[str, ...] = ()  # ended without error but never seen syncing after the refresh
+
+    @property
+    def failed(self) -> bool:
+        """Some bank ended without a confirmed sync (error, 2FA pending or rejected, or unconfirmed)."""
+        return bool(self.errors or self.needs_2fa or self.invalid_2fa or self.unconfirmed)
 
     @property
     def done(self) -> bool:
@@ -86,16 +96,15 @@ def evaluate(aggregations: Sequence[dict[str, Any]], *, awaiting: Collection[str
     """Classify each aggregation once. Banks in `awaiting` just got a 2FA answer and count as syncing."""
     groups: dict[str, list[str]] = {"in_progress": [], "needs_2fa": [], "errors": [], "invalid_2fa": []}
     for agg in aggregations:
-        general = _upper(_status(agg).get("general"))
         if entity_id(agg) in awaiting:
             key = "in_progress"
         elif is_invalid_2fa(agg):
             key = "invalid_2fa"
         elif needs_2fa(agg):
             key = "needs_2fa"
-        elif general in ERROR_STATES:
+        elif _upper(_status(agg).get("general")) in ERROR_STATES:
             key = "errors"
-        elif general == "IN_PROGRESS":
+        elif is_syncing(agg):
             key = "in_progress"
         else:
             continue

@@ -230,6 +230,7 @@ def test_transfers_lists_without_writing(api: respx.MockRouter, store: MemorySes
         ("d2", "c2", ["c2"]),
     ]
     assert body[0]["debit"]["product"] == "Nómina"
+    assert body[0]["debit"]["product_ref"] == "acc1"
     assert body[0]["amount"] == "500.00"
     assert not writes.called
     params = api.routes[2].calls.last.request.url.params
@@ -255,6 +256,15 @@ def test_transfers_apply_with_yes(api: respx.MockRouter, store: MemorySessionSto
     updated = [c.request.url.path.split("/")[-2] for c in writes.calls]
     assert updated == ["d1", "c1", "c2"]
     assert all(json.loads(c.request.content) == {"categoryId": TRANSFER_CATEGORY} for c in writes.calls)
+
+
+def test_transfers_yes_refuses_more_than_max_changes(api: respx.MockRouter, store: MemorySessionStore) -> None:
+    writes = _category_route(api)
+    result = runner.invoke(cli.app, ["transfers", "-m", "2026-10", "--apply", "--yes", "--max-changes", "2"])
+    assert result.exit_code != 0
+    assert "Hay 3 movimientos" in str(result.exception)
+    assert "Posibles traspasos (2)" in result.stdout  # the list is still shown
+    assert not writes.called
 
 
 def test_transfers_apply_asks_and_can_cancel(api: respx.MockRouter, store: MemorySessionStore) -> None:

@@ -14,7 +14,7 @@ from fintonic.client import MAX_2FA_ATTEMPTS, FintonicClient
 from fintonic.errors import InputError
 from fintonic.session import Session
 from fintonic.stores import MemorySessionStore
-from tests.conftest import BFF
+from tests.conftest import API, BFF
 
 runner = CliRunner()
 AGGS = f"{BFF}/openbanking/aggregations/"
@@ -30,6 +30,36 @@ def agg(entity: str, general: str = "COMPLETED", detail: str = "OK", reason: str
 
 def sms_2fa(entity: str) -> dict[str, Any]:
     return agg(entity, "IN_PROGRESS", "2FA", "WAITING_PARAM")
+
+
+def registries(*dates: dict[str, int | None]) -> list[httpx.Response]:
+    """Successive `GET /rest/bankRegistries` answers: bank id -> lastUpdateDate (epoch ms)."""
+    return [
+        httpx.Response(
+            200,
+            json={"data": {"bankRegistries": [{"bankId": b, "lastUpdateDate": d} for b, d in snapshot.items()]}},
+        )
+        for snapshot in dates
+    ]
+
+
+def mock_registries(mock_api: respx.MockRouter, *dates: dict[str, int | None]) -> respx.Route:
+    """Mock bankRegistries; the last snapshot repeats forever."""
+    answers = registries(*dates)
+    return mock_api.get(f"{API}/rest/bankRegistries").mock(
+        side_effect=lambda _request: answers.pop(0) if len(answers) > 1 else answers[0]
+    )
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def _body(route: respx.Route, index: int = -1) -> Any:
@@ -193,6 +223,129 @@ def test_wait_only_for_selected_banks(mock_api: respx.MockRouter, http: httpx.Cl
     assert status.done
 
 
+# ---- did the refresh really sync? (issue #20) ----------------------------------
+
+
+_REAL_WAIT = FintonicClient.wait_for_banks  # the autouse `sleeps` fixture below swaps in its own clock
+
+
+def _wait_since(client: FintonicClient, since: dict[str, int | None], clock: FakeClock) -> Any:
+    return _REAL_WAIT(client, since=since, interval=2, grace=20, sleep=clock.sleep, clock=clock)
+
+
+def test_wait_ignores_final_state_from_before_the_refresh(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session
+) -> None:
+    mock_api.get(AGGS).mock(
+        side_effect=[
+            httpx.Response(200, json=[agg("2091")]),  # previous sync, refresh not picked up yet
+            httpx.Response(200, json=[agg("2091", "IN_PROGRESS")]),
+            httpx.Response(200, json=[agg("2091")]),
+        ]
+    )
+    mock_registries(mock_api, {"2091": 1000})
+    clock = FakeClock()
+
+    status = _wait_since(FintonicClient(session, http=http), {"2091": 1000}, clock)
+
+    assert status.done and not status.failed
+    assert clock.now == 4
+
+
+def test_wait_accepts_newer_last_update_without_seeing_progress(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session
+) -> None:
+    mock_api.get(AGGS).mock(return_value=httpx.Response(200, json=[agg("2091")]))
+    mock_registries(mock_api, {"2091": 2000})
+    clock = FakeClock()
+
+    status = _wait_since(FintonicClient(session, http=http), {"2091": 1000}, clock)
+
+    assert not status.failed
+    assert clock.now == 0
+
+
+def test_wait_reports_bank_that_never_synced(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    mock_api.get(AGGS).mock(return_value=httpx.Response(200, json=[agg("2091"), agg("0182", "ACTIVE_ERROR")]))
+    mock_registries(mock_api, {"2091": 1000, "0182": 1000})
+    clock = FakeClock()
+
+    status = _wait_since(FintonicClient(session, http=http), {"2091": 1000, "0182": 1000}, clock)
+
+    assert status.unconfirmed == ("2091",)
+    assert status.errors == ("0182",)
+    assert status.failed
+    assert clock.now == 20
+
+
+def test_wait_with_stale_error_waits_for_the_new_sync(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session
+) -> None:
+    mock_api.get(AGGS).mock(
+        side_effect=[
+            httpx.Response(200, json=[agg("2091", "ACTIVE_ERROR")]),
+            httpx.Response(200, json=[agg("2091", "IN_PROGRESS")]),
+            httpx.Response(200, json=[agg("2091")]),
+        ]
+    )
+    mock_registries(mock_api, {"2091": 1000})
+
+    status = _wait_since(FintonicClient(session, http=http), {"2091": 1000}, FakeClock())
+
+    assert not status.failed
+
+
+def test_wait_does_not_take_an_old_rejected_2fa_as_this_sync(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session
+) -> None:
+    old = agg("2091", "ACTIVE_ERROR", "OK", "TIMEOUT_WAITING_PARAM")
+    mock_api.get(AGGS).mock(
+        side_effect=[
+            httpx.Response(200, json=[old]),
+            httpx.Response(200, json=[agg("2091", "IN_PROGRESS")]),
+            httpx.Response(200, json=[agg("2091")]),
+        ]
+    )
+    mock_registries(mock_api, {"2091": 1000})
+
+    status = _wait_since(FintonicClient(session, http=http), {"2091": 1000}, FakeClock())
+
+    assert not status.failed
+
+
+def test_wait_accepts_bank_without_baseline(mock_api: respx.MockRouter, http: httpx.Client, session: Session) -> None:
+    """An aggregation with no bankRegistries entry can't be confirmed by date: don't fail it forever."""
+    mock_api.get(AGGS).mock(return_value=httpx.Response(200, json=[agg("9999")]))
+    registry = mock_registries(mock_api, {"2091": 1000})
+    clock = FakeClock()
+
+    status = _wait_since(FintonicClient(session, http=http), {"2091": 1000}, clock)
+
+    assert not status.failed
+    assert clock.now == 0
+    assert not registry.called
+
+
+def test_wait_stops_checking_dates_after_grace(
+    mock_api: respx.MockRouter, http: httpx.Client, session: Session
+) -> None:
+    mock_api.get(AGGS).mock(return_value=httpx.Response(200, json=[agg("2091"), agg("0182", "IN_PROGRESS")]))
+    registry = mock_registries(mock_api, {"2091": 1000, "0182": 1000})
+    clock = FakeClock()
+
+    status = _REAL_WAIT(
+        FintonicClient(session, http=http),
+        since={"2091": 1000, "0182": 1000},
+        timeout=60,
+        grace=20,
+        sleep=clock.sleep,
+        clock=clock,
+    )
+
+    assert status.unconfirmed == ("2091",)
+    assert registry.call_count == 10  # polls at 0, 2, …, 18 s; none in the remaining 40 s
+
+
 # ---- CLI ---------------------------------------------------------------------
 
 
@@ -210,12 +363,18 @@ def tty(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Run the CLI's polling loop without real sleeps, recording them."""
+    """Run the CLI's polling loop without real sleeps (on a fake clock), recording them."""
     recorded: list[float] = []
     original = FintonicClient.wait_for_banks
 
     def fast_wait(self: FintonicClient, **kwargs: Any) -> Any:
-        return original(self, **{**kwargs, "sleep": recorded.append})
+        clock = FakeClock()
+
+        def sleep(seconds: float) -> None:
+            recorded.append(seconds)
+            clock.sleep(seconds)
+
+        return original(self, **{**kwargs, "sleep": sleep, "clock": clock})
 
     monkeypatch.setattr(FintonicClient, "wait_for_banks", fast_wait)
     return recorded
@@ -223,6 +382,7 @@ def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
 def test_cli_refresh_bank(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
     mock_api.get(AGGS).mock(return_value=httpx.Response(200, json=[agg("0182", "IN_PROGRESS"), agg("2091")]))
+    mock_registries(mock_api, {"0182": 1000, "2091": 1000}, {"0182": 1000, "2091": 2000})
     one = mock_api.post(f"{BFF}/openbanking/aggregations/agg-2091/data-actualizations").mock(
         return_value=httpx.Response(202)
     )
@@ -235,6 +395,7 @@ def test_cli_refresh_bank(mock_api: respx.MockRouter, store: MemorySessionStore)
 
 
 def test_cli_refresh_prompts_for_2fa(mock_api: respx.MockRouter, store: MemorySessionStore, tty: None) -> None:
+    mock_registries(mock_api, {"2091": 1000})
     mock_api.post(f"{BFF}/openbanking/aggregations/data-actualizations").mock(return_value=httpx.Response(202))
     mock_api.get(AGGS).mock(
         side_effect=[httpx.Response(200, json=[sms_2fa("2091")]), httpx.Response(200, json=[agg("2091")])]
@@ -251,6 +412,7 @@ def test_cli_refresh_prompts_for_2fa(mock_api: respx.MockRouter, store: MemorySe
 
 def test_cli_refresh_push_confirmation(mock_api: respx.MockRouter, store: MemorySessionStore, tty: None) -> None:
     push = agg("2091", "IN_PROGRESS", "2FA", "BACKGROUND_WAITING_PARAM")
+    mock_registries(mock_api, {"2091": 1000})
     mock_api.post(f"{BFF}/openbanking/aggregations/data-actualizations").mock(return_value=httpx.Response(202))
     mock_api.get(AGGS).mock(side_effect=[httpx.Response(200, json=[push]), httpx.Response(200, json=[agg("2091")])])
     put = mock_api.put(f"{BFF}/openbanking/aggregations/agg-2091/2fa").mock(return_value=httpx.Response(200))
@@ -262,15 +424,69 @@ def test_cli_refresh_push_confirmation(mock_api: respx.MockRouter, store: Memory
 
 
 def test_cli_refresh_no_2fa_only_reports(mock_api: respx.MockRouter, store: MemorySessionStore, tty: None) -> None:
+    mock_registries(mock_api, {"2091": 1000})
     mock_api.post(f"{BFF}/openbanking/aggregations/data-actualizations").mock(return_value=httpx.Response(202))
     mock_api.get(AGGS).mock(return_value=httpx.Response(200, json=[sms_2fa("2091")]))
     put = mock_api.put(f"{BFF}/openbanking/aggregations/agg-2091/2fa")
 
     result = runner.invoke(cli.app, ["refresh", "--no-2fa"])
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 3, result.output  # pending 2FA: not synced, scripts must notice
     assert not put.called
     assert "bank-2fa" in result.stderr
+
+
+def test_cli_refresh_bank_error_exits_non_zero(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
+    mock_registries(mock_api, {"2091": 1000})
+    mock_api.post(f"{BFF}/openbanking/aggregations/data-actualizations").mock(return_value=httpx.Response(202))
+    mock_api.get(AGGS).mock(
+        side_effect=[
+            httpx.Response(200, json=[agg("2091", "IN_PROGRESS")]),
+            httpx.Response(200, json=[agg("2091", "ACTIVE_ERROR")]),
+        ]
+    )
+
+    result = runner.invoke(cli.app, ["refresh"])
+
+    assert result.exit_code == 3, result.output
+    assert "Con error: 2091" in result.stderr
+    assert "actualizados" not in result.stderr
+
+
+def test_cli_refresh_never_seen_syncing_is_not_success(
+    mock_api: respx.MockRouter, store: MemorySessionStore, sleeps: list[float]
+) -> None:
+    mock_registries(mock_api, {"2091": 1_767_225_600_000})  # 2026-01-01
+    mock_api.post(f"{BFF}/openbanking/aggregations/data-actualizations").mock(return_value=httpx.Response(202))
+    mock_api.get(AGGS).mock(return_value=httpx.Response(200, json=[agg("2091")]))
+
+    result = runner.invoke(cli.app, ["refresh"])
+
+    assert result.exit_code == 3, result.output
+    assert "Sin constancia" in result.stderr
+    assert "2091 (última 2026-01-01" in result.stderr
+    assert "actualizados" not in result.stderr
+    assert sum(sleeps) >= 20
+
+
+def test_cli_refresh_timeout_exits_2(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
+    mock_registries(mock_api, {"2091": 1000})
+    mock_api.post(f"{BFF}/openbanking/aggregations/data-actualizations").mock(return_value=httpx.Response(202))
+    mock_api.get(AGGS).mock(return_value=httpx.Response(200, json=[agg("2091", "IN_PROGRESS")]))
+
+    result = runner.invoke(cli.app, ["refresh", "--timeout", "10"])
+
+    assert result.exit_code == 2, result.output
+    assert "Siguen sincronizando" in result.stderr
+
+
+def test_cli_refresh_no_wait_skips_baseline(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
+    trigger = mock_api.post(f"{BFF}/openbanking/aggregations/data-actualizations").mock(
+        return_value=httpx.Response(202)
+    )
+    result = runner.invoke(cli.app, ["refresh", "--no-wait"])
+    assert result.exit_code == 0, result.output
+    assert trigger.called
 
 
 def test_cli_bank_2fa_sends_code_and_waits(
@@ -290,6 +506,22 @@ def test_cli_bank_2fa_sends_code_and_waits(
     assert _body(put) == {"otp": "123456"}
     assert len(sleeps) == 1
     assert "actualizados" in result.stderr
+
+
+def test_cli_bank_2fa_error_exits_3(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
+    mock_api.get(AGGS).mock(
+        side_effect=[
+            httpx.Response(200, json=[sms_2fa("2091")]),  # lookup
+            httpx.Response(200, json=[agg("2091", "IN_PROGRESS")]),
+            httpx.Response(200, json=[agg("2091", "ACTIVE_ERROR")]),
+        ]
+    )
+    mock_api.put(f"{BFF}/openbanking/aggregations/agg-2091/2fa").mock(return_value=httpx.Response(200))
+
+    result = runner.invoke(cli.app, ["bank-2fa", "2091", "123456"])
+
+    assert result.exit_code == 3, result.output
+    assert "Con error: 2091" in result.stderr
 
 
 def test_cli_bank_2fa_rejects_bank_not_waiting(mock_api: respx.MockRouter, store: MemorySessionStore) -> None:
