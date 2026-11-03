@@ -391,7 +391,7 @@ def test_set_date_posts_epoch_millis(mock_api: respx.MockRouter, store: MemorySe
 
     assert result.exit_code == 0, result.output
     assert _body(route) == {"userDate": str(user_date_millis(date(2026, 10, 1)))}
-    assert "Experimental" in result.stderr
+    assert "Experimental" not in result.stderr
     [record] = log.records()
     assert (record.before, record.after) == ("2026-10-30", "2026-10-01")
 
@@ -404,11 +404,12 @@ def test_set_date_rejects_bad_date(store: MemorySessionStore) -> None:
 @pytest.mark.parametrize(
     ("day", "utc"),
     [
-        (date(2026, 10, 30), datetime(2026, 10, 30, 11, 0, tzinfo=UTC)),  # CET, UTC+1
-        (date(2026, 7, 1), datetime(2026, 7, 1, 10, 0, tzinfo=UTC)),  # CEST, UTC+2
+        (date(2026, 10, 30), datetime(2026, 10, 29, 23, 0, tzinfo=UTC)),  # CET, UTC+1
+        (date(2026, 7, 1), datetime(2026, 6, 30, 22, 0, tzinfo=UTC)),  # CEST, UTC+2
     ],
 )
-def test_user_date_millis_is_noon_in_madrid(day: date, utc: datetime) -> None:
+def test_user_date_millis_is_midnight_in_madrid(day: date, utc: datetime) -> None:
+    """The server rounds up to the next UTC midnight, so the instant must sit just before it (#3)."""
     assert user_date_millis(day) == int(utc.timestamp() * 1000)
 
 

@@ -48,7 +48,7 @@ fintonic tx describe <id> "Cena cumple"
 fintonic tx note <id> "pagó Ana la mitad"
 fintonic tx mark-read <id>... | --bank 0182 | --product <id> | --all
 fintonic tx mark-unread <id>...
-fintonic tx set-date <id> 2026-10-01           # EXPERIMENTAL: sin verificar en una cuenta real (#3)
+fintonic tx set-date <id> 2026-10-01           # cambia la fecha del movimiento (verificado en #3)
 fintonic tx history [<id>] [-n 20] [-f json]   # cambios hechos desde este equipo
 fintonic tx undo <id> [--dry-run]              # deshace el último cambio registrado de ese movimiento
 
@@ -148,7 +148,7 @@ Escritura (`POST`/`PUT` salvo que se indique; nunca se reintentan):
 | `/rest/{account,creditcard,deposit,fund,loan,share,pensionplan}/{id}/status` | `{active: bool}` — ocultar/mostrar un producto |
 | `/rest/{tipo}/all/status?bankId=…` | `{active: bool}` — todos los productos de ese tipo en un banco |
 | `/rest/transaction/markAsReadByAccount/{bankId}/{ccc}` · `markAsReadByCreditCard/{bankId}/{cardNumber}` | — (app Android) |
-| `/rest/transaction/{id}/userDate` | `{userDate: "<epoch ms>"}` (app Android; enviamos las 12:00 Europe/Madrid del día, ver `user_date.py`) |
+| `/rest/transaction/{id}/userDate` | `{userDate: "<epoch ms>"}` (app Android; medianoche Europe/Madrid del día: el servidor redondea al siguiente día UTC, ver `user_date.py`) |
 | `DELETE /rest/transaction/{id}/read` | — marca como no leído (app Android) |
 | BFF `/openbanking/aggregations/data-actualizations` | — refresca bancos; luego sondear `GET /openbanking/aggregations/` hasta que no haya `IN_PROGRESS` |
 
