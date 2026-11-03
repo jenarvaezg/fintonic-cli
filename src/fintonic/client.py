@@ -22,16 +22,27 @@ from fintonic.aggregation import (
     second_factor_body,
 )
 from fintonic.config import API_BASE, BFF_BASE
-from fintonic.errors import InputError, NotLoggedInError, SessionExpiredError, raise_for_response
+from fintonic.errors import (
+    ApiError,
+    InputError,
+    NotLoggedInError,
+    SessionExpiredError,
+    raise_for_problem,
+    raise_for_response,
+)
 from fintonic.headers import auth_headers
 from fintonic.http import build_http_client
 from fintonic.models import (
     BankRegistry,
+    CashFlowPeriod,
     Category,
+    CategoryNet,
+    CategoryNetPeriod,
     CategorySuggestion,
     Mandate,
     Position,
     Product,
+    TimeUnit,
     Transaction,
     TransactionDateRange,
 )
@@ -366,6 +377,38 @@ class FintonicClient:
         size = min(page_size, limit) if limit else page_size
         yield from islice(self._paginate(TRANSACTIONS_PATH, filters, size), limit)
 
+    # ---- statistics (BFF) ---------------------------------------------------
+
+    def cash_flow_periods(
+        self, pivot: date, *, unit: TimeUnit = TimeUnit.MONTH, periods: int = 12, page: int = 0
+    ) -> list[CashFlowPeriod]:
+        """Income/expenses/net for the `periods` units ending with the one containing `pivot`, oldest first.
+
+        `page` walks further back, `periods` units at a time.
+        """
+        body = self._stats("stats/period/cashFlow", _period_params(pivot, unit, periods, page))
+        return [CashFlowPeriod.model_validate(raw) for raw in body]
+
+    def category_net_periods(
+        self, category_id: str, pivot: date, *, unit: TimeUnit = TimeUnit.MONTH, periods: int = 12, page: int = 0
+    ) -> list[CategoryNetPeriod]:
+        """Net per period for one leaf category (group ids always come back as zero)."""
+        path = f"stats/period/net/categories/{category_id}"
+        body = self._stats(path, _period_params(pivot, unit, periods, page))
+        return [CategoryNetPeriod.model_validate(raw) for raw in body]
+
+    def category_nets(self, begin: date, end: date) -> list[CategoryNet]:
+        """Net and transaction count per leaf category in [begin, end], N* categories included."""
+        body = self._stats("stats/range/net/categories", {"startDate": begin.isoformat(), "endDate": end.isoformat()})
+        return [CategoryNet.model_validate(raw) for raw in body]
+
+    def _stats(self, path: str, params: Mapping[str, Any]) -> list[Any]:
+        body = self.get(path, params, bff=True)
+        raise_for_problem(body, path)
+        if not isinstance(body, list):
+            raise ApiError(200, "respuesta inesperada del BFF", path)
+        return body
+
     def _paginate(self, path: str, filters: list[tuple[str, Any]], size: int) -> Iterator[Transaction]:
         """Walk a Spring page response (`content`, `last`) until the last or an empty page."""
         page = 0
@@ -395,6 +438,12 @@ def product_read_path(product: Product) -> str:
     if product.kind == "credit_card" and product.card_number:
         return f"rest/transaction/markAsReadByCreditCard/{product.bank_id}/{product.card_number}"
     raise InputError(f"Solo se pueden marcar por producto cuentas y tarjetas; {product.id} es {product.kind}.")
+
+
+def _period_params(pivot: date, unit: TimeUnit, periods: int, page: int) -> dict[str, Any]:
+    if periods < 1 or page < 0:
+        raise InputError("El número de periodos debe ser al menos 1.")
+    return {"pivotDate": pivot.isoformat(), "timeUnit": unit.value, "numberOfPeriods": periods, "page": page}
 
 
 def _compact(params: Mapping[str, Any]) -> dict[str, Any]:
