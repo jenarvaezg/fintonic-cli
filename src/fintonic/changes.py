@@ -97,7 +97,7 @@ def _describe_categories(value: Any, categories: Mapping[str, Category]) -> str:
         return "(sin categoría)"
 
     def name(cid: str) -> str:
-        return f"{categories[cid].name} ({cid})" if cid in categories else cid
+        return f"{categories[cid].label} ({cid})" if cid in categories else cid
 
     if len(value) == 1:
         return name(next(iter(value)))

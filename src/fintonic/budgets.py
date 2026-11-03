@@ -124,7 +124,7 @@ def evaluate(
     return [
         BudgetStatus(
             category_id=budget_id,
-            name=categories[budget_id].name if budget_id in categories else budget_id,
+            name=categories[budget_id].label if budget_id in categories else budget_id,
             limit=limit,
             spent=-sum(r.amount for r in rows if _belongs(r.category_id, budget_id, categories)),
         )
