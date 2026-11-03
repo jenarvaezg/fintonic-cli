@@ -22,7 +22,11 @@ fintonic banks                                 # bancos conectados y estado de s
 fintonic products [account|credit_card|loan|...] [--all]   # sin tipo = todos; --all incluye cancelados
 fintonic categories [--all]
 fintonic transactions --from 2026-10-01 --to 2026-10-31 -c G0898 -s mercadona -n 0 -f csv
-fintonic transactions --product <id> --unread  # id de `fintonic products`
+fintonic transactions --product <id> --unread  # id de cuenta o tarjeta de `fintonic products`
+fintonic transactions -c G0898 -c G0501 --bank 0182 --oldest-first   # -c repetible: cualquiera de ellas
+fintonic transactions --max -100               # gastos de 100 € o más (importes con signo: gastos < 0)
+fintonic transactions --amount -12,50          # importe exacto; o rango: --amount -100..-50, 100.., ..-20
+fintonic transactions --unclassified | --direct-debit
 fintonic summary --month 2026-10 [--group parent] [--exclude-bank 2091] [--exclude-product <id>]
 fintonic refresh [--no-wait] [--timeout 300]  # sincronizar bancos y esperar (avisa de 2FA pendiente)
 
@@ -68,7 +72,8 @@ with FintonicClient(store.load(), store=store) as client:
 - **Logout en servidor**: `fintonic logout` borra primero la sesión local y después invalida el `refresh_token` con `/oidc/logout`. Es best-effort: si falla la red o Fintonic, avisa pero la sesión local ya está borrada. Las sesiones guardadas con versiones anteriores no tienen `refresh_token` y solo se cierran en local.
 - **Cabeceras como la app Android** (`mc/c.java`): `finia_token` y `x-fintonic-user-code` (vienen en las cabeceras `finia_token` y `user-code` del login) en todas las peticiones, y `DEVICE-UUID` solo con el dispositivo verificado (y en `device/provisions` y `device/verification`, como la web). Timeouts de 60 s. El User-Agent sigue siendo el de Chrome: Cloudflare está delante de la API y el resto de cabeceras (`origin`, `referer`) son las de la web.
 - **Movimientos divididos**: `weightedCategories` son céntimos con signo por categoría que suman el total; `summary` reparte cada parte en su categoría. Las categorías `N*` (no computables: traspasos, inversiones, liquidación de tarjeta) se excluyen.
-- **Producto de un movimiento**: `product_id` es el `ccc` de la cuenta o el número de tarjeta; `--product` filtra en cliente dentro del banco.
+- **Filtros en servidor**: `transactions` usa `list/pageable` (el de la app Android) y todos los filtros los aplica Fintonic. `product_id` de un movimiento es el `ccc` de la cuenta o el número de tarjeta, así que `--product` envía `ccc` o `cardNumber`; el resto de productos (préstamos, fondos…) no tienen movimientos.
+- **Importes con signo**: `--min`/`--max`/`--amount` van en euros (`12,50` o `12.50`) y se envían en céntimos con signo; los gastos son negativos, así que `--max -100` son gastos de 100 € o más.
 - **Dispositivo persistente**: se reenvía el `deviceUUID` verificado en cada login, así que el SMS solo se pide la primera vez.
 - Importes en **céntimos** (`quantity`); los modelos exponen `amount` como `Decimal` en euros.
 
@@ -87,8 +92,8 @@ Base `https://api.fintonic.com/finapi`, `Accept: application/vnd.fintonic-v7+jso
 | GET | `/rest/bankRegistries` | bancos y tipos de producto |
 | GET | `/rest/{account,creditcard,deposit,fund,loan,share,pensionplan}/list*` | `{"accounts": {bankId: [...]}}`, saldos en céntimos |
 | GET | `/rest/category/tree` | |
-| GET | `/rest/transaction/list` | `pageLimit`, `pageOffset`, `beginDate`, `endDate`, `categoryId`, `queryText`, `read` |
-| GET | `/rest/transaction/listByBank/{bankId}` | mismos filtros |
+| GET | `/rest/transaction/list/pageable` | página de Spring (`content`, `last`, `totalElements`…); `page`, `size` (máx. 100), `sort=userDate,asc\|desc`, `beginDate`, `endDate`, `categoryId` (repetible, OR), `queryText`, `bankId`, `ccc`, `cardNumber`, `read`, `minAmount`/`maxAmount` (céntimos con signo), `unclassified`, `onlyDirectDebit`, `transactionIds`… |
+| GET | `/rest/transaction/list` · `listByBank/{bankId}` | lo que usa la web: `pageLimit`, `pageOffset` y menos filtros (ya no se usa) |
 | GET | `/rest/transaction/olderNewerTransactionUserDate` | rango de fechas disponible |
 
 Escritura (todas `POST`, nunca se reintentan):
